@@ -2,6 +2,7 @@ import re
 from datetime import datetime
 from typing import List, Dict, Any
 import ast
+import json
 
 
 HEADER_LINE = "============================================================"
@@ -115,16 +116,20 @@ def parse_plus_log(log_text: str) -> List[Dict[str, Any]]:
         ds_raw = None
         brace_depth = 0
         in_ds = False
+        ds_mode = None  # 'brace' or 'fenced'
         ds_lines: List[str] = []
+        ds_fence_opened = False
 
         # Helper to finish ds block
         def finish_ds():
-            nonlocal ds_raw, in_ds, ds_lines, brace_depth
+            nonlocal ds_raw, in_ds, ds_lines, brace_depth, ds_mode, ds_fence_opened
             if ds_lines:
                 ds_raw = "\n".join(ds_lines).strip()
             in_ds = False
             brace_depth = 0
             ds_lines = []
+            ds_mode = None
+            ds_fence_opened = False
 
         while i < len(lines):
             line = lines[i]
@@ -139,23 +144,44 @@ def parse_plus_log(log_text: str) -> List[Dict[str, Any]]:
                 # everything after the colon could include a JSON-like block
                 after = line.split(":", 1)[-1].lstrip()
                 if after:
-                    # Count braces in the same line
                     in_ds = True
                     ds_lines.append(after)
-                    brace_depth += after.count("{") - after.count("}")
-                    if brace_depth <= 0:
-                        finish_ds()
+                    if after.strip().startswith("```"):
+                        ds_mode = 'fenced'
+                        ds_fence_opened = True
+                    else:
+                        ds_mode = 'brace'
+                        brace_depth += after.count("{") - after.count("}")
+                        if brace_depth <= 0:
+                            finish_ds()
                 else:
                     in_ds = True
+                    ds_mode = None
                 # continue
             elif in_ds:
                 ds_lines.append(line)
-                brace_depth += line.count("{") - line.count("}")
-                if brace_depth <= 0:
-                    finish_ds()
+                if ds_mode == 'fenced':
+                    # close on next fence line
+                    if line.strip().startswith("```") and ds_fence_opened:
+                        finish_ds()
+                    else:
+                        ds_fence_opened = True  # we passed the opening line
+                else:
+                    # default to brace mode if not yet set
+                    if ds_mode is None:
+                        if line.strip().startswith("```"):
+                            ds_mode = 'fenced'
+                            ds_fence_opened = True
+                        else:
+                            ds_mode = 'brace'
+                            brace_depth = 0
+                    if ds_mode == 'brace':
+                        brace_depth += line.count("{") - line.count("}")
+                        if brace_depth <= 0:
+                            finish_ds()
             elif s.startswith("信号统计:"):
                 data["signal_stats"] = s.split(":", 1)[-1].strip()
-            elif s.startswith("⚠️") or s.startswith("⚠"):
+            elif s.startswith("⚠️") or s.startswith("⚠") or s.startswith("🔒") or s.startswith("❗") or s.startswith("ℹ"):
                 data["warning"] = s
             elif s.startswith("交易信号:"):
                 data["signal"] = s.split(":", 1)[-1].strip()
@@ -185,6 +211,31 @@ def parse_plus_log(log_text: str) -> List[Dict[str, Any]]:
 
         if ds_raw:
             data["deepseek_raw"] = ds_raw
+            # Try to parse JSON inside fenced block or braces
+            try:
+                # Extract substring between first '{' and last '}'
+                l = ds_raw.find('{')
+                r = ds_raw.rfind('}')
+                if l != -1 and r != -1 and r > l:
+                    obj = json.loads(ds_raw[l:r+1])
+                    # Fill fields if missing
+                    data.setdefault("signal", obj.get("signal"))
+                    data.setdefault("confidence", obj.get("confidence"))
+                    data.setdefault("reason", obj.get("reason"))
+                    sl = obj.get("stop_loss")
+                    tp = obj.get("take_profit")
+                    if sl is not None:
+                        try:
+                            data.setdefault("stop_loss", float(sl))
+                        except Exception:
+                            pass
+                    if tp is not None:
+                        try:
+                            data.setdefault("take_profit", float(tp))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
         # Generate an id for record (prefer exec_time)
         rec_id = data.get("exec_time") or data.get("exec_time_iso") or str(len(items))

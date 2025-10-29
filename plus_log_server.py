@@ -76,6 +76,11 @@ def healthz():
 
 
 def run():
+    # Do an initial scan before serving
+    try:
+        scan_once()
+    except Exception:
+        pass
     t = threading.Thread(target=scanner_loop, daemon=True)
     t.start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=False)
@@ -83,4 +88,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-
