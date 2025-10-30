@@ -9,6 +9,16 @@ from dotenv import load_dotenv
 import json
 import requests
 from datetime import datetime, timedelta
+from overrides_sentiment import (
+    compute_dynamic_base_usdt,
+    print_raw_positions,
+    get_asset_code,
+    get_asset_symbol,
+    get_human_pair,
+    get_sentiment_tokens,
+    get_price_label,
+    get_contract_unit_name,
+)
 
 load_dotenv()
 
@@ -30,7 +40,7 @@ exchange = ccxt.okx({
 
 # 交易参数配置 - 结合两个版本的优点
 TRADE_CONFIG = {
-    'symbol': 'BTC/USDT:USDT',  # OKX的合约符号格式
+    'symbol': get_asset_symbol(),  # 由外部override提供
     'leverage': 10,  # 杠杆倍数,只影响保证金不影响下单价值
     'timeframe': '15m',  # 使用15分钟K线
     'test_mode': False,  # 测试模式
@@ -58,13 +68,13 @@ def setup_exchange():
     try:
 
         # 首先获取合约规格信息
-        print("🔍 获取BTC合约规格...")
+        print(f"🔍 获取{get_asset_code()}合约规格...")
         markets = exchange.load_markets()
         btc_market = markets[TRADE_CONFIG['symbol']]
 
         # 获取合约乘数
         contract_size = float(btc_market['contractSize'])
-        print(f"✅ 合约规格: 1张 = {contract_size} BTC")
+        print(f"✅ 合约规格: 1张 = {contract_size} {get_contract_unit_name()}")
 
         # 存储合约规格到全局配置
         TRADE_CONFIG['contract_size'] = contract_size
@@ -75,6 +85,8 @@ def setup_exchange():
         # 先检查现有持仓
         print("🔍 检查现有持仓模式...")
         positions = exchange.fetch_positions([TRADE_CONFIG['symbol']])
+        # 打印原生持仓数据（未处理）
+        print_raw_positions(exchange, TRADE_CONFIG['symbol'])
 
         has_isolated_position = False
         isolated_position_info = None
@@ -169,9 +181,17 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
         balance = exchange.fetch_balance()
         usdt_balance = balance['USDT']['free']
 
-        # 基础USDT投入
-        base_usdt = config['base_usdt_amount']
-        print(f"💰 可用USDT余额: {usdt_balance:.2f}, 下单基数{base_usdt}")
+        # 基于账户资金与最小下单约束，动态计算下单基数（确保可开单）
+        dynamic_base = compute_dynamic_base_usdt(
+            exchange,
+            TRADE_CONFIG['symbol'],
+            TRADE_CONFIG['leverage'],
+            TRADE_CONFIG.get('contract_size', 0.01),
+            TRADE_CONFIG.get('min_amount', 0.01),
+            config['base_usdt_amount']
+        )
+        base_usdt = dynamic_base or config['base_usdt_amount']
+        print(f"💰 可用USDT余额: {usdt_balance:.2f}, 下单基数(动态): {base_usdt:.2f}")
 
         # 根据信心程度调整 - 修复这里
         confidence_multiplier = {
@@ -325,7 +345,7 @@ def get_sentiment_indicators():
             "startTime": start_time.strftime("%Y-%m-%d %H:%M:%S"),
             "endTime": end_time.strftime("%Y-%m-%d %H:%M:%S"),
             "timeType": "15m",
-            "token": ["BTC"]
+            "token": get_sentiment_tokens(),
         }
 
         headers = {"Content-Type": "application/json", "X-API-KEY": API_KEY}
@@ -599,7 +619,7 @@ def analyze_with_deepseek(price_data):
     pnl_text = f", 持仓盈亏: {current_pos['unrealized_pnl']:.2f} USDT" if current_pos else ""
 
     prompt = f"""
-    你是一个专业的加密货币交易分析师。请基于以下BTC/USDT {TRADE_CONFIG['timeframe']}周期数据进行分析：
+    你是一个专业的加密货币交易分析师。请基于以下{get_human_pair()} {TRADE_CONFIG['timeframe']}周期数据进行分析：
 
     {kline_text}
 
@@ -614,7 +634,7 @@ def analyze_with_deepseek(price_data):
     - 时间: {price_data['timestamp']}
     - 本K线最高: ${price_data['high']:,.2f}
     - 本K线最低: ${price_data['low']:,.2f}
-    - 本K线成交量: {price_data['volume']:.2f} BTC
+    - 本K线成交量: {price_data['volume']:.2f} {get_contract_unit_name()}
     - 价格变化: {price_data['price_change']:+.2f}%
     - 当前持仓: {position_text}{pnl_text}
 
@@ -1034,9 +1054,11 @@ def trading_bot():
     if not price_data:
         return
 
-    print(f"BTC当前价格: ${price_data['price']:,.2f}")
+    print(f"{get_price_label()}: ${price_data['price']:,.2f}")
     print(f"数据周期: {TRADE_CONFIG['timeframe']}")
     print(f"价格变化: {price_data['price_change']:+.2f}%")
+    # 每轮打印原生持仓数据，便于对齐实盘状态
+    print_raw_positions(exchange, TRADE_CONFIG['symbol'])
 
     # 2. 使用DeepSeek分析（带重试）
     signal_data = analyze_with_deepseek_with_retry(price_data)
@@ -1050,7 +1072,7 @@ def trading_bot():
 
 def main():
     """主函数"""
-    print("BTC/USDT OKX自动交易机器人启动成功！")
+    print(f"{get_human_pair()} OKX自动交易机器人启动成功！")
     print("融合技术指标策略 + OKX实盘接口")
 
     if TRADE_CONFIG['test_mode']:
