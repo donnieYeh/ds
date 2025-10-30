@@ -11,6 +11,12 @@ import requests
 from datetime import datetime, timedelta
 from overrides_sentiment import (
     compute_dynamic_base_usdt,
+    get_equity_info,
+    compute_nominal_budget,
+    compute_min_notional,
+    compute_atr_stop_distance,
+    compute_risk_based_contracts,
+    pretrade_feasible_contracts,
     get_asset_code,
     get_asset_symbol,
     get_human_pair,
@@ -162,6 +168,80 @@ price_history = []
 signal_history = []
 position = None
 
+
+def calculate_intelligent_position_v2(signal_data, price_data, current_position):
+    """智能仓位（权益预算 + ATR风险 + 可行性 + 同向不减仓）"""
+    config = TRADE_CONFIG['position_management']
+    if not config.get('enable_intelligent_position', True):
+        return 0.1
+
+    try:
+        eq = get_equity_info(exchange)
+        usdt_free = eq['free']
+        equity = eq['equity']
+        safety_ratio = config.get('safety_ratio', 0.8)
+
+        base = compute_dynamic_base_usdt(
+            exchange,
+            TRADE_CONFIG['symbol'],
+            TRADE_CONFIG['leverage'],
+            TRADE_CONFIG.get('contract_size', 0.01),
+            TRADE_CONFIG.get('min_amount', 0.01),
+            config['base_usdt_amount'],
+            safety_ratio,
+        ) or config['base_usdt_amount']
+
+        budget = compute_nominal_budget(equity, TRADE_CONFIG['leverage'], safety_ratio)
+        conf_mult = {
+            'HIGH': config['high_confidence_multiplier'],
+            'MEDIUM': config['medium_confidence_multiplier'],
+            'LOW': config['low_confidence_multiplier']
+        }.get(signal_data.get('confidence'), 1.0)
+        trend = price_data['trend_analysis'].get('overall', '震荡整理')
+        trend_mult = config['trend_strength_multiplier'] if trend in ['强势上涨', '强势下跌'] else 1.0
+        rsi = price_data['technical_data'].get('rsi', 50)
+        rsi_mult = 0.7 if (rsi > 75 or rsi < 25) else 1.0
+
+        suggested = base * conf_mult * trend_mult * rsi_mult
+        policy_cap = equity * config.get('max_position_ratio', 10)
+        final_nominal = min(suggested, budget, policy_cap)
+        nominal_contracts = final_nominal / (price_data['price'] * TRADE_CONFIG['contract_size'])
+
+        stop_dist = compute_atr_stop_distance(price_data.get('full_data'), config.get('atr_period', 14), config.get('atr_multiple', 1.5))
+        R_usdt = equity * config.get('risk_per_trade_ratio', 0.01)
+        risk_contracts = compute_risk_based_contracts(R_usdt, stop_dist, TRADE_CONFIG['contract_size'])
+
+        target = round(min(nominal_contracts, risk_contracts), 2)
+        feasible = pretrade_feasible_contracts(
+            exchange,
+            TRADE_CONFIG['symbol'],
+            target,
+            price_data['price'],
+            TRADE_CONFIG['contract_size'],
+            TRADE_CONFIG['leverage'],
+            usdt_free,
+            config.get('taker_fee_rate', 0.0005),
+            1.02,
+        )
+
+        min_ct = TRADE_CONFIG.get('min_amount', 0.01)
+        signal_side = 'long' if signal_data.get('signal') == 'BUY' else ('short' if signal_data.get('signal') == 'SELL' else None)
+        if feasible is None or feasible <= 0:
+            return 0
+        if 0 < feasible < min_ct:
+            if current_position and signal_side and current_position.get('side') == signal_side:
+                feasible = current_position.get('size', min_ct)
+            else:
+                return 0
+
+        if current_position and signal_side and current_position.get('side') == signal_side:
+            if feasible < current_position.get('size', 0):
+                feasible = current_position['size']
+
+        return round(feasible, 2)
+    except Exception:
+        # fallback: fixed tiny contract
+        return max(TRADE_CONFIG.get('min_amount', 0.01), 0.01)
 
 def calculate_intelligent_position(signal_data, price_data, current_position):
     """计算智能仓位大小 - 修复版"""
@@ -346,7 +426,10 @@ def get_sentiment_indicators():
         }
 
         headers = {"Content-Type": "application/json", "X-API-KEY": API_KEY}
-        response = requests.post(API_URL, json=request_body, headers=headers)
+        response = requests.post(API_URL, json=request_body, headers=headers, timeout=5)
+        if response.status_code != 200:
+            print(f"⚠️ 情绪API状态码异常: {response.status_code}")
+            return None
 
         if response.status_code == 200:
             data = response.json()
@@ -399,6 +482,17 @@ def get_sentiment_indicators():
     except Exception as e:
         print(f"情绪指标获取失败: {e}")
         return None
+
+
+def get_sentiment_indicators_with_retry(max_retries: int = 2, delay_sec: int = 1):
+    """对情绪API做轻量重试，失败则降级为None。"""
+    for attempt in range(max_retries):
+        data = get_sentiment_indicators()
+        if data:
+            return data
+        time.sleep(delay_sec)
+    print("⚠️ 情绪指标暂不可用，已降级为技术分析-only")
+    return None
 
 
 def get_market_trend(df):
@@ -602,7 +696,7 @@ def analyze_with_deepseek(price_data):
         signal_text = f"\n【上次交易信号】\n信号: {last_signal.get('signal', 'N/A')}\n信心: {last_signal.get('confidence', 'N/A')}"
 
     # 获取情绪数据
-    sentiment_data = get_sentiment_indicators()
+    sentiment_data = get_sentiment_indicators_with_retry()
     # 简化情绪文本 多了没用
     if sentiment_data:
         sign = '+' if sentiment_data['net_sentiment'] >= 0 else ''
@@ -789,7 +883,10 @@ def execute_intelligent_trade(signal_data, price_data):
         #             return
 
     # 计算智能仓位
-    position_size = calculate_intelligent_position(signal_data, price_data, current_position)
+    position_size = calculate_intelligent_position_v2(signal_data, price_data, current_position)
+    if not position_size or position_size <= 0:
+        print("⚠️ 目标仓位不可行（低于最小张数或保证金/费用不足），跳过执行")
+        return
 
     print(f"交易信号: {signal_data['signal']}")
     print(f"信心程度: {signal_data['confidence']}")
