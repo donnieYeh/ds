@@ -11,7 +11,6 @@ import requests
 from datetime import datetime, timedelta
 from overrides_sentiment import (
     compute_dynamic_base_usdt,
-    print_raw_positions,
     get_asset_code,
     get_asset_symbol,
     get_human_pair,
@@ -85,8 +84,6 @@ def setup_exchange():
         # 先检查现有持仓
         print("🔍 检查现有持仓模式...")
         positions = exchange.fetch_positions([TRADE_CONFIG['symbol']])
-        # 打印原生持仓数据（未处理）
-        print_raw_positions(exchange, TRADE_CONFIG['symbol'])
 
         has_isolated_position = False
         isolated_position_info = None
@@ -1057,8 +1054,6 @@ def trading_bot():
     print(f"{get_price_label()}: ${price_data['price']:,.2f}")
     print(f"数据周期: {TRADE_CONFIG['timeframe']}")
     print(f"价格变化: {price_data['price_change']:+.2f}%")
-    # 每轮打印原生持仓数据，便于对齐实盘状态
-    print_raw_positions(exchange, TRADE_CONFIG['symbol'])
 
     # 2. 使用DeepSeek分析（带重试）
     signal_data = analyze_with_deepseek_with_retry(price_data)

@@ -31,18 +31,6 @@ def compute_dynamic_base_usdt(exchange, symbol, leverage, contract_size, min_amo
     return float(base_usdt)
 
 
-def print_raw_positions(exchange, symbol):
-    try:
-        positions = exchange.fetch_positions([symbol])
-        print("[OKX 原生持仓数据] =>")
-        try:
-            print(json.dumps(positions, ensure_ascii=False, indent=2))
-        except Exception:
-            print(str(positions))
-    except Exception as e:
-        print(f"[OKX 原生持仓数据] 获取失败: {e}")
-
-
 # ===== Coin override helpers =====
 _ASSET_CODE = "ETH"
 
