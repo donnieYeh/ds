@@ -743,7 +743,7 @@ def analyze_with_deepseek(price_data):
     - 情绪数据延迟 → 降低权重，以实时技术指标为准
     3. **风险管理** (权重10%)：考虑持仓、盈亏状况和止损位置
     4. **趋势跟随**: 明确趋势出现时立即行动，不要过度等待
-    5. 因为做的是btc，做多权重可以大一点点
+    5. 因为做的是eth，做多权重可以大一点点
     6. **信号明确性**:
     - 强势上涨趋势 → BUY信号
     - 强势下跌趋势 → SELL信号  
@@ -871,16 +871,16 @@ def execute_intelligent_trade(signal_data, price_data):
             new_side = None
 
         # 如果方向相反，需要高信心才执行
-        # if new_side != current_side:
-        #     if signal_data['confidence'] != 'HIGH':
-        #         print(f"🔒 非高信心反转信号，保持现有{current_side}仓")
-        #         return
+        if new_side != current_side:
+            if signal_data['confidence'] != 'HIGH':
+                print(f"🔒 非高信心反转信号，保持现有{current_side}仓")
+                return
 
-        #     if len(signal_history) >= 2:
-        #         last_signals = [s['signal'] for s in signal_history[-2:]]
-        #         if signal_data['signal'] in last_signals:
-        #             print(f"🔒 近期已出现{signal_data['signal']}信号，避免频繁反转")
-        #             return
+            if len(signal_history) >= 2:
+                last_signals = [s['signal'] for s in signal_history[-2:]]
+                if signal_data['signal'] in last_signals:
+                    print(f"🔒 近期已出现{signal_data['signal']}信号，避免频繁反转")
+                    return
 
     # 计算智能仓位
     position_size = calculate_intelligent_position_v2(signal_data, price_data, current_position)
