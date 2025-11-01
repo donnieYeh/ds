@@ -168,6 +168,21 @@ price_history = []
 signal_history = []
 position = None
 
+# 反手平仓事件位图（低位为最近一次），用于限频
+reduce_hist = 0
+
+
+def _can_reverse_recently() -> bool:
+    """最近3次无反手平仓事件时才允许反手。"""
+    mask = 0b111
+    return (reduce_hist & mask) == 0
+
+
+def _record_reverse_close_event():
+    """记录一次反手平仓事件（左移并置1，限定在8位窗口）。"""
+    global reduce_hist
+    reduce_hist = ((reduce_hist << 1) | 1) & 0xFF
+
 
 def calculate_intelligent_position_v2(signal_data, price_data, current_position):
     """智能仓位（权益预算 + ATR风险 + 可行性 + 同向不减仓）"""
@@ -876,11 +891,9 @@ def execute_intelligent_trade(signal_data, price_data):
                 print(f"🔒 非高信心反转信号，保持现有{current_side}仓")
                 return
 
-            if len(signal_history) >= 2:
-                last_signals = [s['signal'] for s in signal_history[-2:]]
-                if signal_data['signal'] in last_signals:
-                    print(f"🔒 近期已出现{signal_data['signal']}信号，避免频繁反转")
-                    return
+            if not _can_reverse_recently():
+                print("🔒 近期有反手平仓，避免频繁反转")
+                return
 
     # 计算智能仓位
     position_size = calculate_intelligent_position_v2(signal_data, price_data, current_position)
@@ -915,23 +928,22 @@ def execute_intelligent_trade(signal_data, price_data):
                         TRADE_CONFIG['symbol'],
                         'buy',
                         current_position['size'],
-                        params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
+                        params={'reduceOnly': True}
                     )
                     time.sleep(1)
                     # 开多仓
                     exchange.create_market_order(
                         TRADE_CONFIG['symbol'],
                         'buy',
-                        position_size,
-                        params={'tag': '60bb4a8d3416BCDE'}
+                        position_size
                     )
+                    _record_reverse_close_event()
                 else:
                     print("⚠️ 检测到空头持仓但数量为0，直接开多仓")
                     exchange.create_market_order(
                         TRADE_CONFIG['symbol'],
                         'buy',
-                        position_size,
-                        params={'tag': '60bb4a8d3416BCDE'}
+                        position_size
                     )
 
             elif current_position and current_position['side'] == 'long':
@@ -947,8 +959,7 @@ def execute_intelligent_trade(signal_data, price_data):
                         exchange.create_market_order(
                             TRADE_CONFIG['symbol'],
                             'buy',
-                            add_size,
-                            params={'tag': '60bb4a8d3416BCDE'}
+                            add_size
                         )
                     else:
                         # 减仓
@@ -959,7 +970,7 @@ def execute_intelligent_trade(signal_data, price_data):
                             TRADE_CONFIG['symbol'],
                             'sell',
                             reduce_size,
-                            params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
+                            params={'reduceOnly': True}
                         )
                 else:
                     print(
@@ -970,8 +981,7 @@ def execute_intelligent_trade(signal_data, price_data):
                 exchange.create_market_order(
                     TRADE_CONFIG['symbol'],
                     'buy',
-                    position_size,
-                    params={'tag': '60bb4a8d3416BCDE'}
+                    position_size
                 )
 
         elif signal_data['signal'] == 'SELL':
@@ -984,23 +994,22 @@ def execute_intelligent_trade(signal_data, price_data):
                         TRADE_CONFIG['symbol'],
                         'sell',
                         current_position['size'],
-                        params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
+                        params={'reduceOnly': True}
                     )
                     time.sleep(1)
                     # 开空仓
                     exchange.create_market_order(
                         TRADE_CONFIG['symbol'],
                         'sell',
-                        position_size,
-                        params={'tag': '60bb4a8d3416BCDE'}
+                        position_size
                     )
+                    _record_reverse_close_event()
                 else:
                     print("⚠️ 检测到多头持仓但数量为0，直接开空仓")
                     exchange.create_market_order(
                         TRADE_CONFIG['symbol'],
                         'sell',
-                        position_size,
-                        params={'tag': '60bb4a8d3416BCDE'}
+                        position_size
                     )
 
             elif current_position and current_position['side'] == 'short':
@@ -1016,8 +1025,7 @@ def execute_intelligent_trade(signal_data, price_data):
                         exchange.create_market_order(
                             TRADE_CONFIG['symbol'],
                             'sell',
-                            add_size,
-                            params={'tag': '60bb4a8d3416BCDE'}
+                            add_size
                         )
                     else:
                         # 减仓
@@ -1028,7 +1036,7 @@ def execute_intelligent_trade(signal_data, price_data):
                             TRADE_CONFIG['symbol'],
                             'buy',
                             reduce_size,
-                            params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
+                            params={'reduceOnly': True}
                         )
                 else:
                     print(
@@ -1039,8 +1047,7 @@ def execute_intelligent_trade(signal_data, price_data):
                 exchange.create_market_order(
                     TRADE_CONFIG['symbol'],
                     'sell',
-                    position_size,
-                    params={'tag': '60bb4a8d3416BCDE'}
+                    position_size
                 )
 
         elif signal_data['signal'] == 'HOLD':
@@ -1063,15 +1070,13 @@ def execute_intelligent_trade(signal_data, price_data):
                     exchange.create_market_order(
                         TRADE_CONFIG['symbol'],
                         'buy',
-                        position_size,
-                        params={'tag': '60bb4a8d3416BCDE'}
+                        position_size
                     )
                 elif signal_data['signal'] == 'SELL':
                     exchange.create_market_order(
                         TRADE_CONFIG['symbol'],
                         'sell',
-                        position_size,
-                        params={'tag': '60bb4a8d3416BCDE'}
+                        position_size
                     )
                 print("直接开仓成功")
             except Exception as e2:
