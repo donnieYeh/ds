@@ -169,6 +169,8 @@ signal_history = []
 position = None
 
 # 反手平仓事件位图（低位为最近一次），用于限频
+# 注意：必须在每次评估周期都左移一次（无反手则写入0，有反手则写入1），
+# 否则会因为只在反手时记录而永久保持为1，导致误判“近期有反手”。
 reduce_hist = 0
 
 
@@ -178,10 +180,14 @@ def _can_reverse_recently() -> bool:
     return (reduce_hist & mask) == 0
 
 
-def _record_reverse_close_event():
-    """记录一次反手平仓事件（左移并置1，限定在8位窗口）。"""
+def _record_reverse_close_event(did_reverse: bool = True):
+    """记录一次评估周期的反手事件：
+    - did_reverse=True：左移并置1，表示本周期发生了反手平仓
+    - did_reverse=False：左移并置0，表示本周期未发生反手平仓
+    保持8位窗口。
+    """
     global reduce_hist
-    reduce_hist = ((reduce_hist << 1) | 1) & 0xFF
+    reduce_hist = ((reduce_hist << 1) | (1 if did_reverse else 0)) & 0xFF
 
 
 def calculate_intelligent_position_v2(signal_data, price_data, current_position):
@@ -871,6 +877,7 @@ def analyze_with_deepseek(price_data):
 def execute_intelligent_trade(signal_data, price_data):
     """执行智能交易 - OKX版本（支持同方向加仓减仓）"""
     global position
+    did_reverse = False
 
     current_position = get_current_position()
     print(f"当前持仓: {current_position}")
@@ -889,16 +896,19 @@ def execute_intelligent_trade(signal_data, price_data):
         if new_side != current_side:
             if signal_data['confidence'] != 'HIGH':
                 print(f"🔒 非高信心反转信号，保持现有{current_side}仓")
+                _record_reverse_close_event(False)
                 return
 
             if not _can_reverse_recently():
                 print("🔒 近期有反手平仓，避免频繁反转")
+                _record_reverse_close_event(False)
                 return
 
     # 计算智能仓位
     position_size = calculate_intelligent_position_v2(signal_data, price_data, current_position)
     if not position_size or position_size <= 0:
         print("⚠️ 目标仓位不可行（低于最小张数或保证金/费用不足），跳过执行")
+        _record_reverse_close_event(False)
         return
 
     print(f"交易信号: {signal_data['signal']}")
@@ -910,10 +920,12 @@ def execute_intelligent_trade(signal_data, price_data):
     # 风险管理
     if signal_data['confidence'] == 'LOW' and not TRADE_CONFIG['test_mode']:
         print("⚠️ 低信心信号，跳过执行")
+        _record_reverse_close_event(False)
         return
 
     if TRADE_CONFIG['test_mode']:
         print("测试模式 - 仅模拟交易")
+        _record_reverse_close_event(False)
         return
 
     try:
@@ -936,8 +948,8 @@ def execute_intelligent_trade(signal_data, price_data):
                         TRADE_CONFIG['symbol'],
                         'buy',
                         position_size
-                    )
-                    _record_reverse_close_event()
+                )
+                    did_reverse = True
                 else:
                     print("⚠️ 检测到空头持仓但数量为0，直接开多仓")
                     exchange.create_market_order(
@@ -1003,7 +1015,7 @@ def execute_intelligent_trade(signal_data, price_data):
                         'sell',
                         position_size
                     )
-                    _record_reverse_close_event()
+                    did_reverse = True
                 else:
                     print("⚠️ 检测到多头持仓但数量为0，直接开空仓")
                     exchange.create_market_order(
@@ -1052,12 +1064,14 @@ def execute_intelligent_trade(signal_data, price_data):
 
         elif signal_data['signal'] == 'HOLD':
             print("建议观望，不执行交易")
+            _record_reverse_close_event(False)
             return
 
         print("智能交易执行成功")
         time.sleep(2)
         position = get_current_position()
         print(f"更新后持仓: {position}")
+        _record_reverse_close_event(did_reverse)
 
     except Exception as e:
         print(f"交易执行失败: {e}")
@@ -1084,6 +1098,7 @@ def execute_intelligent_trade(signal_data, price_data):
 
         import traceback
         traceback.print_exc()
+        _record_reverse_close_event(did_reverse)
 
 
 def analyze_with_deepseek_with_retry(price_data, max_retries=2):
