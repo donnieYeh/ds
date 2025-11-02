@@ -3,7 +3,7 @@ import threading
 import time
 from typing import List, Dict, Any
 
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, Blueprint
 
 from plus_log_parser import parse_plus_log
 
@@ -13,6 +13,7 @@ SCAN_INTERVAL_SEC = int(os.environ.get("PLUS_LOG_SCAN_INTERVAL", "60"))
 
 
 app = Flask(__name__)
+bp = Blueprint("ds", __name__, url_prefix="/ds")
 
 _records: List[Dict[str, Any]] = []
 _last_read_err: str | None = None
@@ -55,12 +56,12 @@ def scanner_loop():
         time.sleep(SCAN_INTERVAL_SEC)
 
 
-@app.route("/")
+@bp.route("/")
 def index():
     return render_template("index.html")
 
 
-@app.route("/api/records")
+@bp.route("/api/records")
 def api_records():
     return jsonify({
         "records": _records,
@@ -70,7 +71,7 @@ def api_records():
     })
 
 
-@app.route("/healthz")
+@bp.route("/healthz")
 def healthz():
     return ("ok", 200)
 
@@ -81,6 +82,8 @@ def run():
         scan_once()
     except Exception:
         pass
+    # Register blueprint after initial setup
+    app.register_blueprint(bp)
     t = threading.Thread(target=scanner_loop, daemon=True)
     t.start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=False)

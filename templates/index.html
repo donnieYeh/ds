@@ -30,7 +30,8 @@
   </style>
   <script>
     async function fetchRecords() {
-      const res = await fetch('/api/records');
+      // Use relative path so it works under /ds
+      const res = await fetch('api/records');
       return res.json();
     }
 
