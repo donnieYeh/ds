@@ -873,7 +873,7 @@ def execute_intelligent_trade(signal_data, price_data):
     global position
 
     current_position = get_current_position()
-
+    print(f"当前持仓: {current_position}")
     # 防止频繁反转的逻辑保持不变
     if current_position and signal_data['signal'] != 'HOLD':
         current_side = current_position['side']  # 'long' 或 'short'
@@ -905,7 +905,7 @@ def execute_intelligent_trade(signal_data, price_data):
     print(f"信心程度: {signal_data['confidence']}")
     print(f"智能仓位: {position_size:.2f} 张")
     print(f"理由: {signal_data['reason']}")
-    print(f"当前持仓: {current_position}")
+    # print(f"当前持仓: {current_position}")
 
     # 风险管理
     if signal_data['confidence'] == 'LOW' and not TRADE_CONFIG['test_mode']:
