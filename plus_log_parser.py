@@ -7,6 +7,17 @@ import json
 
 HEADER_LINE = "============================================================"
 
+# Matches leading timestamps like:
+#  - 2025-11-06T09:00:11:
+#  - 2025-11-06 09:00:11:
+#  - 2025-11-06T09:00:11.123Z:
+#  - 2025-11-06T09:00:11+08:00:
+TS_PREFIX_RE = re.compile(r"^\s*\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?:\s*")
+
+
+def _strip_ts_prefix(line: str) -> str:
+    return TS_PREFIX_RE.sub("", line, count=1)
+
 
 def _safe_float(val: str):
     try:
@@ -60,7 +71,9 @@ def split_records(log_text: str) -> List[str]:
     out: List[str] = []
     while i < n:
         s = lines[i].strip()
-        if s == HEADER_LINE and i + 1 < n and lines[i + 1].strip().startswith("执行时间:"):
+        next_line = lines[i + 1] if i + 1 < n else ""
+        next_no_ts = _strip_ts_prefix(next_line).strip()
+        if s == HEADER_LINE and next_no_ts.startswith("执行时间:"):
             # Start of a record
             start_idx = i + 1  # include 执行时间行
             # Skip next header line if present immediately after exec_time
@@ -70,7 +83,7 @@ def split_records(log_text: str) -> List[str]:
             # Collect until next header that starts a new record
             k = j
             while k < n:
-                if lines[k].strip() == HEADER_LINE and (k + 1) < n and lines[k + 1].strip().startswith("执行时间:"):
+                if lines[k].strip() == HEADER_LINE and (k + 1) < n and _strip_ts_prefix(lines[k + 1]).strip().startswith("执行时间:"):
                     break
                 k += 1
             out.append("\n".join(lines[start_idx:k]).strip())
@@ -82,7 +95,7 @@ def split_records(log_text: str) -> List[str]:
     if not out:
         cur: List[str] = []
         for ln in lines:
-            if ln.strip().startswith("执行时间:"):
+            if _strip_ts_prefix(ln).strip().startswith("执行时间:"):
                 if cur:
                     out.append("\n".join(cur).strip())
                     cur = []
@@ -106,8 +119,8 @@ def parse_plus_log(log_text: str) -> List[Dict[str, Any]]:
         # Extract fields
         i = 0
         # exec time
-        if lines and lines[0].strip().startswith("执行时间:"):
-            raw_ts, iso_ts = _parse_exec_time(lines[0])
+        if lines and _strip_ts_prefix(lines[0]).strip().startswith("执行时间:"):
+            raw_ts, iso_ts = _parse_exec_time(_strip_ts_prefix(lines[0]))
             data["exec_time"] = raw_ts
             data["exec_time_iso"] = iso_ts
             i = 1
@@ -133,7 +146,7 @@ def parse_plus_log(log_text: str) -> List[Dict[str, Any]]:
 
         while i < len(lines):
             line = lines[i]
-            s = line.strip()
+            s = _strip_ts_prefix(line).strip()
             if s.startswith("ETH当前价格:"):
                 data["eth_price"] = _parse_price(s)
             elif s.startswith("数据周期:"):
@@ -183,6 +196,9 @@ def parse_plus_log(log_text: str) -> List[Dict[str, Any]]:
                 data["signal_stats"] = s.split(":", 1)[-1].strip()
             elif s.startswith("⚠️") or s.startswith("⚠") or s.startswith("🔒") or s.startswith("❗") or s.startswith("ℹ"):
                 data["warning"] = s
+            elif s.startswith("🕒"):
+                # clock/info lines (等待到整点等) — ignore so they don't override action
+                pass
             elif s.startswith("交易信号:"):
                 data["signal"] = s.split(":", 1)[-1].strip()
             elif s.startswith("信心程度:"):
@@ -193,7 +209,7 @@ def parse_plus_log(log_text: str) -> List[Dict[str, Any]]:
                 data["stop_loss"] = _parse_price(s)
             elif s.startswith("止盈:"):
                 data["take_profit"] = _parse_price(s)
-            elif s.startswith("当前持仓:"):
+            elif s.startswith("当前持仓:") or s.startswith("更新后持仓:"):
                 pos_text = s.split(":", 1)[-1].strip()
                 data["position"] = _parse_position(pos_text)
             elif s.startswith("根据账户余额调整下单数量为"):
