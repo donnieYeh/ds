@@ -941,6 +941,13 @@ def execute_intelligent_trade(signal_data, price_data):
 
     current_position = get_current_position()
     print(f"当前持仓: {current_position}")
+
+    # 无持仓时仅接受高信心开仓信号
+    if not current_position and signal_data['signal'] in {'BUY', 'SELL'} and signal_data['confidence'] != 'HIGH':
+        print("🔒 当前无持仓，仅高信心信号才允许开仓，跳过执行")
+        _record_reverse_close_event(False)
+        return
+
     # 防止频繁反转的逻辑保持不变
     if current_position and signal_data['signal'] != 'HOLD':
         current_side = current_position['side']  # 'long' 或 'short'
