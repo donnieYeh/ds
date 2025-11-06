@@ -33,6 +33,21 @@ deepseek_client = OpenAI(
     base_url="https://api.deepseek.com"
 )
 
+# 读取环境变量中可配置的最近K线数量，默认20，限定范围1-200
+def _get_recent_kline_count_default() -> int:
+    try:
+        val = int(os.getenv('RECENT_KLINE_COUNT', '20'))
+        return max(1, min(200, val))
+    except Exception:
+        return 20
+
+# 解析布尔类环境变量（"1/true/yes/on" 为真）
+def _get_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
 # 初始化OKX交易所
 exchange = ccxt.okx({
     'options': {
@@ -50,6 +65,8 @@ TRADE_CONFIG = {
     'timeframe': '15m',  # 使用15分钟K线
     'test_mode': False,  # 测试模式
     'data_points': 96,  # 24小时数据（96根15分钟K线）
+    'recent_kline_count': _get_recent_kline_count_default(),  # 近N根K线用于提示/决策
+    'print_prompt': _get_bool_env('PRINT_PROMPT', False),  # 是否打印提示词
     'analysis_periods': {
         'short_term': 20,  # 短期均线
         'medium_term': 50,  # 中期均线
@@ -66,6 +83,39 @@ TRADE_CONFIG = {
         'trend_strength_multiplier': 1.2
     }
 }
+
+
+def print_runtime_config():
+    """启动时打印关键可配置项（不含敏感信息）。"""
+    try:
+        cfg = TRADE_CONFIG
+        ap = cfg.get('analysis_periods', {})
+        pm = cfg.get('position_management', {})
+        env_recent = os.getenv('RECENT_KLINE_COUNT')
+        env_print_prompt = os.getenv('PRINT_PROMPT')
+
+        print("\n【运行配置】")
+        print(f"- 交易对: {get_human_pair()} ({cfg.get('symbol')})")
+        print(f"- 周期: {cfg.get('timeframe')}  杠杆: {cfg.get('leverage')}x  模式: {'测试' if cfg.get('test_mode') else '实盘'}")
+        print(f"- 历史K线数量(data_points): {cfg.get('data_points')}")
+        recent_line = f"- 最近K线数量(recent_kline_count): {cfg.get('recent_kline_count')}"
+        if env_recent:
+            recent_line += f"  (来自环境变量 RECENT_KLINE_COUNT={env_recent})"
+        print(recent_line)
+        print(
+            f"- 打印Prompt: {'启用' if cfg.get('print_prompt') else '禁用'}"
+            + (f"  (来自环境变量 PRINT_PROMPT={env_print_prompt})" if env_print_prompt is not None else "")
+        )
+        print(f"- 指标周期: 短期={ap.get('short_term')}, 中期={ap.get('medium_term')}, 长期={ap.get('long_term')}")
+        print(
+            "- 智能仓位: "
+            + ("启用" if pm.get('enable_intelligent_position', True) else "禁用")
+            + f"; 基数USDT={pm.get('base_usdt_amount')}, 倍数(H/M/L)="
+            + f"{pm.get('high_confidence_multiplier')}/{pm.get('medium_confidence_multiplier')}/{pm.get('low_confidence_multiplier')}, "
+            + f"最大仓位比例={pm.get('max_position_ratio')}, 趋势倍数={pm.get('trend_strength_multiplier')}"
+        )
+    except Exception as e:
+        print(f"⚠️ 配置打印失败: {e}")
 
 
 def setup_exchange():
@@ -576,7 +626,7 @@ def get_btc_ohlcv_enhanced():
             'volume': current_data['volume'],
             'timeframe': TRADE_CONFIG['timeframe'],
             'price_change': ((current_data['close'] - previous_data['close']) / previous_data['close']) * 100,
-            'kline_data': df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].tail(10).to_dict('records'),
+            'kline_data': df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].tail(TRADE_CONFIG['recent_kline_count']).to_dict('records'),
             'technical_data': {
                 'sma_5': current_data.get('sma_5', 0),
                 'sma_20': current_data.get('sma_20', 0),
@@ -704,8 +754,9 @@ def analyze_with_deepseek(price_data):
     technical_analysis = generate_technical_analysis_text(price_data)
 
     # 构建K线数据文本
-    kline_text = f"【最近5根{TRADE_CONFIG['timeframe']}K线数据】\n"
-    for i, kline in enumerate(price_data['kline_data'][-5:]):
+    recent_n = TRADE_CONFIG.get('recent_kline_count', 20)
+    kline_text = f"【最近{recent_n}根{TRADE_CONFIG['timeframe']}K线数据】\n"
+    for i, kline in enumerate(price_data['kline_data'][-recent_n:]):
         trend = "阳线" if kline['close'] > kline['open'] else "阴线"
         change = ((kline['close'] - kline['open']) / kline['open']) * 100
         kline_text += f"K线{i + 1}: {trend} 开盘:{kline['open']:.2f} 收盘:{kline['close']:.2f} 涨跌:{change:+.2f}%\n"
@@ -815,6 +866,15 @@ def analyze_with_deepseek(price_data):
         "confidence": "HIGH|MEDIUM|LOW"
     }}
     """
+
+    # 可选打印构造的Prompt，便于调试与复查
+    if TRADE_CONFIG.get('print_prompt'):
+        try:
+            print("\n===== DeepSeek Prompt Begin =====")
+            print(prompt)
+            print("===== DeepSeek Prompt End =====\n")
+        except Exception as e:
+            print(f"⚠️ 打印Prompt失败: {e}")
 
     try:
         response = deepseek_client.chat.completions.create(
@@ -1194,6 +1254,9 @@ def main():
 
     print(f"交易周期: {TRADE_CONFIG['timeframe']}")
     print("已启用完整技术指标分析和持仓跟踪功能")
+
+    # 启动时打印关键配置
+    print_runtime_config()
 
     # 设置交易所
     if not setup_exchange():
