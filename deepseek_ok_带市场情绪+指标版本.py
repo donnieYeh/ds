@@ -951,7 +951,7 @@ def analyze_with_deepseek(price_data):
     signal_text = ""
     if signal_history:
         last_signal = signal_history[-1]
-        signal_text = f"\n【上次交易信号】\n信号: {last_signal.get('signal', 'N/A')}\n信心: {last_signal.get('confidence', 'N/A')}"
+        signal_text = f"\n  【上次交易信号】\n信号: {last_signal.get('signal', 'N/A')}\n信心: {last_signal.get('confidence', 'N/A')}"
 
     # 获取情绪数据
     sentiment_data = get_sentiment_indicators_with_retry()
