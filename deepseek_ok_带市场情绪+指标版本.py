@@ -424,6 +424,85 @@ def generate_sma_analysis(source, short=5, mid=20, long=80, price_col="close"):
 
     return text
 
+def generate_momentum_analysis(price_data):
+    """
+    从 price_data['technical_data'] 中提取 RSI、MACD、信号线，生成面向 LLM 的动量指标分析文本。
+    不进行指标计算，仅做语义解释。
+
+    参数:
+        price_data: dict
+            包含 'technical_data' 字段的行情数据（参见 get_btc_ohlcv_enhanced 返回结构）
+    """
+    if not price_data or "technical_data" not in price_data:
+        return "📊 动量指标分析：缺少技术指标数据，无法进行动量判断。"
+
+    tech = price_data.get("technical_data", {})
+    rsi = tech.get("rsi")
+    macd = tech.get("macd")
+    signal = tech.get("macd_signal")
+    hist = tech.get("macd_histogram")
+
+    # --- 数据可用性检查 ---
+    if rsi is None or macd is None or signal is None:
+        return "📊 动量指标分析：RSI 或 MACD 数据缺失，暂无法提供有效动量信号。"
+
+    # --- RSI 分析 ---
+    if rsi >= 80:
+        rsi_desc = "RSI 处于极端超买区，短期上涨透支，存在回调风险。"
+    elif rsi >= 70:
+        rsi_desc = "RSI 处于超买区，多头动能强，但追高需谨慎。"
+    elif 60 <= rsi < 70:
+        rsi_desc = "RSI 位于中性偏强区，多头略占优势。"
+    elif 40 <= rsi < 60:
+        rsi_desc = "RSI 接近中性，多空力量均衡，市场可能处于震荡阶段。"
+    elif 30 <= rsi < 40:
+        rsi_desc = "RSI 位于中性偏弱区，空头略占上风。"
+    elif 20 <= rsi < 30:
+        rsi_desc = "RSI 进入超卖区，存在技术性反弹可能。"
+    else:
+        rsi_desc = "RSI 处于极端超卖区，短期下跌过度，可能出现强势反弹。"
+
+    # --- MACD 分析 ---
+    if macd > signal:
+        macd_state = "MACD 主线高于信号线，多头动能占优。"
+        if hist and hist > 0:
+            macd_desc = "多头柱体持续放大，动能延续良好。"
+        elif hist and hist < 0:
+            macd_desc = "虽然主线高于信号线，但柱体转负，显示上行动能减弱。"
+        else:
+            macd_desc = "动能维持正向但无明显放大。"
+    elif macd < signal:
+        macd_state = "MACD 主线低于信号线，空头动能占优。"
+        if hist and hist < 0:
+            macd_desc = "空头柱体放大，趋势压力明显。"
+        elif hist and hist > 0:
+            macd_desc = "尽管主线低于信号线，但柱体转正，空头动能出现减弱迹象。"
+        else:
+            macd_desc = "动能偏空但趋于平缓。"
+    else:
+        macd_state = "MACD 与信号线几乎重合，动能方向暂不明朗。"
+        macd_desc = "市场处于动能转换或整理阶段。"
+
+    # --- 综合结论（LLM友好标签） ---
+    if rsi >= 60 and macd > signal:
+        overall = "整体动能评估：多头动能占优，市场偏强，可关注延续性。"
+    elif rsi <= 40 and macd < signal:
+        overall = "整体动能评估：空头动能占优，短期承压，宜谨慎操作。"
+    elif 45 <= rsi <= 55:
+        overall = "整体动能评估：动能中性，方向不明，适合等待突破信号。"
+    else:
+        overall = "整体动能评估：多空信号交织，市场处于转换期，宜结合趋势结构观察。"
+
+    text = (
+        "📊 动量指标分析：\n"
+        f"- RSI：{rsi:.2f}。{rsi_desc}\n"
+        f"- MACD 主线：{macd:.4f}，信号线：{signal:.4f}。{macd_state}{macd_desc}\n"
+        f"- {overall}\n"
+        "- 提示：动量信号仅作为辅助依据，应结合均线结构、价格形态与风险控制共同评估。\n"
+    )
+
+    return text
+
 
 def calculate_intelligent_position(signal_data, price_data, current_position):
     """计算智能仓位大小 - 修复版"""
@@ -769,6 +848,7 @@ def generate_technical_analysis_text(price_data):
     trend = price_data.get('trend_analysis', {})
     levels = price_data.get('levels_analysis', {})
     sma_analysis_text = generate_sma_analysis(price_data)
+    momentum_analysis_text = generate_momentum_analysis(price_data)
 
     # 检查数据有效性
     def safe_float(value, default=0):
@@ -784,10 +864,7 @@ def generate_technical_analysis_text(price_data):
     - 整体趋势: {trend.get('overall', 'N/A')}
     - MACD方向（提供趋势动能强度判断）: {trend.get('macd', 'N/A')}
 
-    📊 动量指标:
-    - RSI: {safe_float(tech['rsi']):.2f} ({'超买' if safe_float(tech['rsi']) > 70 else '超卖' if safe_float(tech['rsi']) < 30 else '中性'})
-    - MACD: {safe_float(tech['macd']):.4f}
-    - 信号线: {safe_float(tech['macd_signal']):.4f}
+    {momentum_analysis_text}
 
     🎚️ 布林带位置: {safe_float(tech['bb_position']):.2%} ({'上部' if safe_float(tech['bb_position']) > 0.7 else '下部' if safe_float(tech['bb_position']) < 0.3 else '中部'})
 
