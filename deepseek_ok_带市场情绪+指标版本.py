@@ -314,6 +314,117 @@ def calculate_intelligent_position_v2(signal_data, price_data, current_position)
         # fallback: fixed tiny contract
         return max(TRADE_CONFIG.get('min_amount', 0.01), 0.01)
 
+
+def generate_sma_analysis(source, short=5, mid=20, long=80, price_col="close"):
+    """
+    基于已计算好的 5 / 20 / 80 周期 SMA 生成面向 LLM 的趋势描述文本。
+
+    支持两种输入:
+        - price_data 字典：需包含 'full_data' (带有 sma_X 列) 与当前 price
+        - DataFrame：需包含 close 及相应的 sma_X 列
+    """
+    import numpy as np
+
+    price_now = None
+    df = None
+    tech = {}
+
+    if isinstance(source, dict):
+        price_data = source
+        df = price_data.get('full_data')
+        tech = price_data.get('technical_data', {})
+        price_now = price_data.get('price')
+    else:
+        df = source
+
+    if df is None or len(df) < long + 5:
+        return "📈 移动平均线分析：数据不足，暂无法给出可靠的均线趋势评估，仅供参考。"
+
+    sma_cols = {
+        'short': f'sma_{short}',
+        'mid': f'sma_{mid}',
+        'long': f'sma_{long}'
+    }
+
+    for col in sma_cols.values():
+        if col not in df.columns:
+            return f"📈 移动平均线分析：缺少 {col} 数据，暂无法评估均线结构。"
+
+    sma_s = df[sma_cols['short']].astype(float)
+    sma_m = df[sma_cols['mid']].astype(float)
+    sma_l = df[sma_cols['long']].astype(float)
+
+    price_series = df[price_col].astype(float) if price_col in df.columns else None
+    if price_now is None and price_series is not None:
+        price_now = float(price_series.iloc[-1])
+    elif price_now is None:
+        return "📈 移动平均线分析：缺少价格数据，无法完成评估。"
+
+    sma_s_now = float(tech.get(sma_cols['short'], sma_s.iloc[-1])) if tech else float(sma_s.iloc[-1])
+    sma_m_now = float(tech.get(sma_cols['mid'], sma_m.iloc[-1])) if tech else float(sma_m.iloc[-1])
+    sma_l_now = float(tech.get(sma_cols['long'], sma_l.iloc[-1])) if tech else float(sma_l.iloc[-1])
+    price_now = float(price_now)
+
+    # 如有 NaN，直接降级提示
+    if any(np.isnan([sma_s_now, sma_m_now, sma_l_now])):
+        return "📈 移动平均线分析：当前均线数据尚未完全形成，暂不作为主要决策依据。"
+
+    # 均线结构判定
+    if sma_s_now > sma_m_now > sma_l_now:
+        structure = "5 > 20 > 80，形成多头排列，趋势偏多。"
+    elif sma_s_now < sma_m_now < sma_l_now:
+        structure = "5 < 20 < 80，形成空头排列，趋势偏空。"
+    else:
+        structure = "均线互相纠缠或缺乏明确排列结构，偏震荡或趋势不明。"
+
+    # 价格相对位置
+    max_sma = max(sma_s_now, sma_m_now, sma_l_now)
+    min_sma = min(sma_s_now, sma_m_now, sma_l_now)
+
+    if price_now > max_sma:
+        pos_desc = "当前价格位于所有均线上方，属相对强势区域，偏多头环境。"
+    elif price_now < min_sma:
+        pos_desc = "当前价格位于所有均线下方，属相对弱势区域，偏空头环境。"
+    else:
+        # 介于某些均线之间，给一点层次感
+        if price_now >= sma_m_now:
+            pos_desc = "当前价格介于中长期均线附近，短期虽有支撑，但上方仍需观察动能延续。"
+        elif price_now <= sma_m_now:
+            pos_desc = "当前价格介于短中均线之间，存在震荡或方向选择阶段。"
+        else:
+            pos_desc = "当前价格位于均线密集区附近，市场处于震荡平衡状态。"
+
+    # 趋势稳定性：看均线斜率是否同向
+    def slope(series, window=3):
+        if len(series.dropna()) < window + 1:
+            return 0.0
+        return float(series.iloc[-1] - series.iloc[-1 - window])
+
+    slope_s = slope(sma_s)
+    slope_m = slope(sma_m)
+    slope_l = slope(sma_l)
+
+    same_direction = (slope_s >= 0 and slope_m >= 0 and slope_l >= 0) or \
+                     (slope_s <= 0 and slope_m <= 0 and slope_l <= 0)
+
+    if same_direction and abs(slope_l) > 0:
+        stability = "短中长周期均线大致同向，趋势具有一定延续性，可作为本周期的重要参考基线。"
+    elif abs(slope_s) > 0 and abs(slope_m) < 1e-9 and abs(slope_l) < 1e-9:
+        stability = "仅短周期均线出现明显拐动，中长期仍趋平，可能是局部波动或假突破，需谨慎放大短线信号。"
+    else:
+        stability = "均线方向不一致，说明多空力量正在博弈，趋势稳定性一般，应结合其他指标与风险控制。"
+
+    text = (
+        "📈 移动平均线分析（趋势基线）：\n"
+        f"- 使用 {short} / {mid} / {long} 周期简单移动平均线（SMA）衡量短期、中期与长周期趋势。\n"
+        f"- 当前均线结构：{structure}\n"
+        f"- 价格位置评估：{pos_desc}\n"
+        f"- 趋势稳定性判断：{stability}\n"
+    )
+
+    return text
+
+
 def calculate_intelligent_position(signal_data, price_data, current_position):
     """计算智能仓位大小 - 修复版"""
     config = TRADE_CONFIG['position_management']
@@ -410,7 +521,7 @@ def calculate_technical_indicators(df):
         # 移动平均线
         df['sma_5'] = df['close'].rolling(window=5, min_periods=1).mean()
         df['sma_20'] = df['close'].rolling(window=20, min_periods=1).mean()
-        df['sma_50'] = df['close'].rolling(window=50, min_periods=1).mean()
+        df['sma_80'] = df['close'].rolling(window=80, min_periods=1).mean()
 
         # 指数移动平均线
         df['ema_12'] = df['close'].ewm(span=12).mean()
@@ -573,7 +684,7 @@ def get_market_trend(df):
 
         # 多时间框架趋势分析
         trend_short = "上涨" if current_price > df['sma_20'].iloc[-1] else "下跌"
-        trend_medium = "上涨" if current_price > df['sma_50'].iloc[-1] else "下跌"
+        trend_medium = "上涨" if current_price > df['sma_80'].iloc[-1] else "下跌"
 
         # MACD趋势
         macd_trend = "bullish" if df['macd'].iloc[-1] > df['macd_signal'].iloc[-1] else "bearish"
@@ -630,7 +741,7 @@ def get_btc_ohlcv_enhanced():
             'technical_data': {
                 'sma_5': current_data.get('sma_5', 0),
                 'sma_20': current_data.get('sma_20', 0),
-                'sma_50': current_data.get('sma_50', 0),
+                'sma_80': current_data.get('sma_80', 0),
                 'rsi': current_data.get('rsi', 0),
                 'macd': current_data.get('macd', 0),
                 'macd_signal': current_data.get('macd_signal', 0),
@@ -657,6 +768,7 @@ def generate_technical_analysis_text(price_data):
     tech = price_data['technical_data']
     trend = price_data.get('trend_analysis', {})
     levels = price_data.get('levels_analysis', {})
+    sma_analysis_text = generate_sma_analysis(price_data)
 
     # 检查数据有效性
     def safe_float(value, default=0):
@@ -664,16 +776,13 @@ def generate_technical_analysis_text(price_data):
 
     analysis_text = f"""
     【技术指标分析】
-    📈 移动平均线:
-    - 5周期: {safe_float(tech['sma_5']):.2f} | 价格相对: {(price_data['price'] - safe_float(tech['sma_5'])) / safe_float(tech['sma_5']) * 100:+.2f}%
-    - 20周期: {safe_float(tech['sma_20']):.2f} | 价格相对: {(price_data['price'] - safe_float(tech['sma_20'])) / safe_float(tech['sma_20']) * 100:+.2f}%
-    - 50周期: {safe_float(tech['sma_50']):.2f} | 价格相对: {(price_data['price'] - safe_float(tech['sma_50'])) / safe_float(tech['sma_50']) * 100:+.2f}%
+    {sma_analysis_text}
 
     🎯 趋势分析:
     - 短期趋势: {trend.get('short_term', 'N/A')}
     - 中期趋势: {trend.get('medium_term', 'N/A')}
     - 整体趋势: {trend.get('overall', 'N/A')}
-    - MACD方向: {trend.get('macd', 'N/A')}
+    - MACD方向（提供趋势动能强度判断）: {trend.get('macd', 'N/A')}
 
     📊 动量指标:
     - RSI: {safe_float(tech['rsi']):.2f} ({'超买' if safe_float(tech['rsi']) > 70 else '超卖' if safe_float(tech['rsi']) < 30 else '中性'})
@@ -755,7 +864,7 @@ def analyze_with_deepseek(price_data):
 
     # 构建K线数据文本
     recent_n = TRADE_CONFIG.get('recent_kline_count', 20)
-    kline_text = f"【最近{recent_n}根{TRADE_CONFIG['timeframe']}K线数据】\n"
+    kline_text = f"【最近{recent_n}根{TRADE_CONFIG['timeframe']}K线数据(K线20为最新数据)】\n"
     for i, kline in enumerate(price_data['kline_data'][-recent_n:]):
         trend = "阳线" if kline['close'] > kline['open'] else "阴线"
         change = ((kline['close'] - kline['open']) / kline['open']) * 100
