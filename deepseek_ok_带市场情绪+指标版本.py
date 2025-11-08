@@ -610,6 +610,90 @@ def generate_bollinger_analysis(price_data, lookback: int = 40):
 
     return "\n".join(parts)
 
+def evaluate_overheat(price_data):
+    """
+    基于已有技术数据，给出一个“动能是否可能透支”的评估结果。
+    仅作为特征输入给大模型，不是硬风控规则。
+
+    返回:
+        {
+            "level": "none" | "mild" | "strong",
+            "factors": [str, ...]  # 描述原因，供拼接进 prompt
+        }
+    """
+    tech = price_data.get("technical_data", {}) or {}
+    rsi = tech.get("rsi")
+    bb_pos = tech.get("bb_position")
+    macd_hist = tech.get("macd_histogram")
+    sma_5 = tech.get("sma_5")
+    sma_20 = tech.get("sma_20")
+
+    factors = []
+
+    try:
+        if rsi is not None:
+            rsi = float(rsi)
+        if bb_pos is not None:
+            bb_pos = float(bb_pos)
+        if macd_hist is not None:
+            macd_hist = float(macd_hist)
+        if sma_5 is not None and sma_20 is not None:
+            sma_5 = float(sma_5)
+            sma_20 = float(sma_20)
+    except (TypeError, ValueError):
+        return {"level": "none", "factors": ["技术数据异常，未进行透支评估"]}
+
+    # 1) 价格相对布林带的位置
+    if bb_pos is not None:
+        if bb_pos >= 1.05:
+            factors.append("价格明显高于布林上轨")
+        elif bb_pos >= 0.95:
+            factors.append("价格接近布林带上沿")
+
+    # 2) RSI 高位区
+    if rsi is not None:
+        if rsi >= 80:
+            factors.append("RSI 处于极高水平")
+        elif rsi >= 70:
+            factors.append("RSI 处于高位区间")
+
+    # 3) 均线加速或乖离（简单看 5 与 20 的差）
+    if sma_5 and sma_20:
+        diff_ratio = (sma_5 - sma_20) / sma_20 if sma_20 != 0 else 0
+        if diff_ratio > 0.03:
+            factors.append("短期价格/均线相对中期均线乖离偏大")
+
+    # 4) MACD 柱体衰减（需要 full_data，看最近几根）
+    df = price_data.get("full_data")
+    if df is not None and "macd_histogram" in df.columns:
+        recent = df["macd_histogram"].tail(4).tolist()
+        if len([x for x in recent if x is not None]) >= 3:
+            # 简单判断：从正高值开始走低，或在高位缩短
+            cleaned = [float(x) for x in recent if x is not None]
+            if len(cleaned) >= 3 and cleaned[-1] < cleaned[-2] > cleaned[-3] and cleaned[-2] > 0:
+                factors.append("MACD 动能在高位出现减弱迹象")
+
+    # 归纳 level（温和，不当成铁律，只是语义标签）
+    strong_signals = [
+        "价格明显高于布林上轨",
+        "RSI 处于极高水平",
+        "MACD 动能在高位出现减弱迹象",
+        "短期价格/均线相对中期均线乖离偏大",
+    ]
+
+    if not factors:
+        level = "none"
+    else:
+        score = sum(1 for f in factors if f in strong_signals)
+        if score >= 3:
+            level = "strong"
+        elif score >= 1:
+            level = "mild"
+        else:
+            level = "none"
+
+    return {"level": level, "factors": factors}
+
 
 def calculate_intelligent_position(signal_data, price_data, current_position):
     """计算智能仓位大小 - 修复版"""
@@ -957,6 +1041,8 @@ def generate_technical_analysis_text(price_data):
     sma_analysis_text = generate_sma_analysis(price_data)
     momentum_analysis_text = generate_momentum_analysis(price_data)
     boll_text = generate_bollinger_analysis(price_data)
+    overheat = evaluate_overheat(price_data)
+
 
     # 检查数据有效性
     def safe_float(value, default=0):
@@ -979,6 +1065,10 @@ def generate_technical_analysis_text(price_data):
     💰 关键水平:
     - 静态阻力: {safe_float(levels.get('static_resistance', 0)):.2f}
     - 静态支撑: {safe_float(levels.get('static_support', 0)):.2f}
+
+    【动能透支评估 - 系统辅助信息】
+        - 当前透支等级: {overheat["level"]}
+        - 参考信号: { "；".join(overheat["factors"]) if overheat["factors"] else "无明显透支信号" }
     """
     return analysis_text
 
@@ -1102,6 +1192,25 @@ def analyze_with_deepseek(price_data):
     4. 若技术信号之间存在明显冲突：
         - 例如：趋势看多，但多项信号提示可能见顶或动能衰减，
         - 优先选择更保守的方案（降低置信度、小仓或HOLD），并在理由中说明冲突点。
+
+    【动能透支处理原则】
+
+        你会收到一段“动能透支评估 - 系统辅助信息”，其中包含 level（none/mild/strong）以及参考信号说明。
+        请按以下方式理解和使用（这是思考方向，而不是死规则）：
+
+        - 若 level = "strong":
+        - 优先考虑这是阶段性高风险区域；
+        - 降低做多信心，倾向小仓或观望，而不是给出 HIGH 信心 BUY；
+        - 如仍认为可以做多，必须在理由中清晰说明为何当前结构仍支持顺势参与。
+
+        - 若 level = "mild":
+        - 说明部分高位或动能放缓迹象，需要更谨慎评估；
+        - 可以给出 BUY，但不应简单视为“无脑强势”，应考虑更合理的仓位与保护。
+
+        - 若 level = "none":
+        - 说明当前不存在明显透支信号，可以更专注于趋势与结构本身的判断。
+
+        在任何情况下，请综合 K线结构、趋势、动量、布林带和情绪，不要因为“强势”或“单一信号”就给出激进决策。
 
 
     【交易指导原则 - 必须遵守】
