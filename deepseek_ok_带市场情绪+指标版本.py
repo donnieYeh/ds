@@ -772,6 +772,105 @@ def evaluate_price_volume_pattern(price_data, lookback: int = 20):
 
     return {"label": "normal", "reasons": reasons}
 
+def estimate_rr_context(price_data, lookback: int = 40):
+    """
+    基于近期波动区间与已有支撑阻力，给出当前多空操作的结构性风险回报评估。
+
+    说明：
+    - 仅作为供大模型参考的特征，不直接做开平仓决策。
+    - 优先使用 levels_analysis 中的最近支撑/阻力；
+      若缺失，则退化为最近 lookback 根K线的高低区间。
+    """
+    df = price_data.get("full_data")
+    if df is None or len(df) < max(20, lookback):
+        return {
+            "label": "unknown",
+            "rr_value": None,
+            "reason": "K线样本不足，暂不提供风险回报结构评估。"
+        }
+
+    recent = df.tail(lookback)
+    try:
+        current_price = float(recent["close"].iloc[-1])
+        recent_high = float(recent["high"].max())
+        recent_low = float(recent["low"].min())
+    except Exception:
+        return {
+            "label": "unknown",
+            "rr_value": None,
+            "reason": "价格数据异常，未能评估风险回报结构。"
+        }
+
+    # 尝试读取已有关键位（如果你的 levels_analysis 有不同字段名，可在这里补充兼容）
+    levels = (price_data.get("levels_analysis") or {}) if isinstance(price_data, dict) else {}
+    nearest_support = levels.get("nearest_support") or levels.get("support") or None
+    nearest_resistance = levels.get("nearest_resistance") or levels.get("resistance") or None
+
+    # 用关键位算结构性 R:R
+    rr_value = None
+    label = "unknown"
+    reasons = []
+
+    def _valid(x):
+        try:
+            return x is not None and float(x) > 0
+        except Exception:
+            return False
+
+    if _valid(nearest_support) and _valid(nearest_resistance):
+        nearest_support = float(nearest_support)
+        nearest_resistance = float(nearest_resistance)
+
+        # 要求支撑在当前价下方、阻力在上方，否则说明当前就在极端位置
+        if nearest_support < current_price < nearest_resistance:
+            risk = current_price - nearest_support
+            reward = nearest_resistance - current_price
+
+            if risk > 0 and reward > 0:
+                rr_value = reward / risk
+                # 标签逻辑：温和分层，不当铁律
+                if rr_value >= 2.0:
+                    label = "favorable"
+                    reasons.append("上方潜在空间明显大于下方风险，结构性R:R偏优。")
+                elif rr_value >= 1.2:
+                    label = "balanced"
+                    reasons.append("上方空间与下方风险大致接近，结构性R:R中性。")
+                else:
+                    label = "unfavorable"
+                    reasons.append("价格更靠近压力位，潜在收益相对有限，下行风险相对更大。")
+            else:
+                label = "unknown"
+                reasons.append("当前价格接近关键支撑或阻力，难以计算合理R:R。")
+
+        else:
+            # 当前价已经非常接近/突破关键位，回落到区间逻辑
+            nearest_support = None
+            nearest_resistance = None
+
+    # 若关键位不可用或不合理，退化为区间位置法
+    if label == "unknown" and (not _valid(nearest_support) or not _valid(nearest_resistance)):
+        rng = max(recent_high - recent_low, 1e-9)
+        position = (current_price - recent_low) / rng  # 0=区间底，1=区间顶
+
+        if position < 0.3:
+            label = "favorable"
+            reasons.append("价格位于近期波动区间偏下部，上行弹性相对更大。")
+        elif position > 0.7:
+            label = "unfavorable"
+            reasons.append("价格位于近期区间偏上部，下行回撤风险更大。")
+        else:
+            label = "balanced"
+            reasons.append("价格位于区间中部，风险与潜在收益相对均衡。")
+
+    if not reasons:
+        reasons.append("量价与关键位信息有限，风险回报结构偏中性处理。")
+
+    return {
+        "label": label,            # 'favorable' / 'balanced' / 'unfavorable' / 'unknown'
+        "rr_value": rr_value,      # 可为 None，仅作参考展示
+        "reason": " ".join(reasons)
+    }
+
 
 def calculate_intelligent_position(signal_data, price_data, current_position):
     """计算智能仓位大小 - 修复版"""
@@ -1121,6 +1220,17 @@ def generate_technical_analysis_text(price_data):
     boll_text = generate_bollinger_analysis(price_data)
     overheat = evaluate_overheat(price_data)
     pvp = evaluate_price_volume_pattern(price_data)
+    rr_info = estimate_rr_context(price_data)
+
+    rr_text = (
+        "【风险回报评估】\n"
+        f"- 当前结构标签: {rr_info['label']}\n"
+        f"- 参考说明: {rr_info['reason']}\n"
+    )
+
+    if rr_info.get("rr_value") is not None:
+        rr_text += f"- 结构性R:R参考值: 约 {rr_info['rr_value']:.2f}:1（仅作结构参考，并非精确测算）。\n"
+
 
     # 检查数据有效性
     def safe_float(value, default=0):
@@ -1151,6 +1261,8 @@ def generate_technical_analysis_text(price_data):
     【量价结构评估】
         - 当前形态标签: {pvp['label']}
         - 参考说明: {"；".join(pvp["reasons"]) if pvp.get("reasons") else "无明显异常信号"}
+
+    {rr_text}
     """
     return analysis_text
 
