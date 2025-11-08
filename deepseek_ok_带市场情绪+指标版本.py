@@ -64,6 +64,7 @@ TRADE_CONFIG = {
     'leverage': 10,  # 杠杆倍数,只影响保证金不影响下单价值
     'timeframe': '15m',  # 使用15分钟K线
     'test_mode': False,  # 测试模式
+    'require_high_confidence_entry': _get_bool_env('REQUIRE_HIGH_CONFIDENCE_ENTRY', True),  # 是否仅允许高信心开单
     'data_points': 96,  # 24小时数据（96根15分钟K线）
     'recent_kline_count': _get_recent_kline_count_default(),  # 近N根K线用于提示/决策
     'print_prompt': _get_bool_env('PRINT_PROMPT', False),  # 是否打印提示词
@@ -113,6 +114,12 @@ def print_runtime_config():
             + f"; 基数USDT={pm.get('base_usdt_amount')}, 倍数(H/M/L)="
             + f"{pm.get('high_confidence_multiplier')}/{pm.get('medium_confidence_multiplier')}/{pm.get('low_confidence_multiplier')}, "
             + f"最大仓位比例={pm.get('max_position_ratio')}, 趋势倍数={pm.get('trend_strength_multiplier')}"
+        )
+        require_high = cfg.get('require_high_confidence_entry', True)
+        env_require_high = os.getenv('REQUIRE_HIGH_CONFIDENCE_ENTRY')
+        print(
+            f"- 高信心开单限制: {'启用' if require_high else '禁用'}"
+            + (f"  (来自环境变量 REQUIRE_HIGH_CONFIDENCE_ENTRY={env_require_high})" if env_require_high is not None else "")
         )
     except Exception as e:
         print(f"⚠️ 配置打印失败: {e}")
@@ -1937,10 +1944,16 @@ def execute_intelligent_trade(signal_data, price_data):
     did_reverse = False
 
     current_position = get_current_position()
+    require_high_conf = TRADE_CONFIG.get('require_high_confidence_entry', True)
     print(f"当前持仓: {current_position}")
 
     # 无持仓时仅接受高信心开仓信号
-    if not current_position and signal_data['signal'] in {'BUY', 'SELL'} and signal_data['confidence'] != 'HIGH':
+    if (
+        require_high_conf
+        and not current_position
+        and signal_data['signal'] in {'BUY', 'SELL'}
+        and signal_data['confidence'] != 'HIGH'
+    ):
         print("🔒 当前无持仓，仅高信心信号才允许开仓，跳过执行")
         _record_reverse_close_event(False)
         return
@@ -1958,7 +1971,7 @@ def execute_intelligent_trade(signal_data, price_data):
 
         # 如果方向相反，需要高信心才执行
         if new_side != current_side:
-            if signal_data['confidence'] != 'HIGH':
+            if require_high_conf and signal_data['confidence'] != 'HIGH':
                 print(f"🔒 非高信心反转信号，保持现有{current_side}仓")
                 _record_reverse_close_event(False)
                 return
