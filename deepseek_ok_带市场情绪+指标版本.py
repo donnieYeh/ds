@@ -1015,7 +1015,7 @@ def evaluate_price_volume_pattern(price_data, lookback: int = 20):
     return {"label": "normal", "reasons": reasons}
 
 def compute_risk_reward_for_sides(price_data: pd.DataFrame,
-                                  lookback: int = 96,
+                                  lookback: int = 50,
                                   recent_exclude: int = 8,
                                   breakout_eps: float = 0.001) -> dict:
     """
