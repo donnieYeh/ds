@@ -694,6 +694,84 @@ def evaluate_overheat(price_data):
 
     return {"level": level, "factors": factors}
 
+def evaluate_price_volume_pattern(price_data, lookback: int = 20):
+    """
+    基于最近K线的价格与成交量关系，评估当前是否更像：
+    - 有支撑的有效突破（clean_breakout）
+    - 可能的假突破/冲高回落（possible_fake_breakout）
+    - 动能不足的弱突破（weak_breakout）
+    - 普通震荡/无明显信号（normal）
+
+    仅用于给大模型提供结构化线索，不直接做交易决策。
+    """
+    df = price_data.get("full_data")
+    if df is None:
+        return {"label": "normal", "reasons": ["缺少完整K线数据，未评估量价形态"]}
+
+    required_cols = {"open", "high", "low", "close", "volume"}
+    if not required_cols.issubset(df.columns):
+        return {"label": "normal", "reasons": ["K线数据缺少必要字段，未评估量价形态"]}
+
+    if len(df) < lookback + 3:
+        return {"label": "normal", "reasons": ["历史样本不足，量价评估不具稳定性"]}
+
+    recent = df.tail(lookback + 2).copy()
+    last = recent.iloc[-1]
+    prev = recent.iloc[-2]
+    hist = recent.iloc[:-1]
+
+    try:
+        o, h, l, c, v = map(float, (last["open"], last["high"], last["low"], last["close"], last["volume"]))
+        prev_high_max = float(hist["high"].max())
+        avg_vol = float(hist["volume"].mean())
+    except Exception:
+        return {"label": "normal", "reasons": ["量价数据异常，未评估量价形态"]}
+
+    if avg_vol <= 0:
+        return {"label": "normal", "reasons": ["平均成交量异常，未评估量价形态"]}
+
+    # 基本形态特征
+    rng = max(h - l, 1e-9)
+    body = abs(c - o)
+    upper_shadow = h - max(c, o)
+    lower_shadow = min(c, o) - l
+    vol_ratio = v / avg_vol
+
+    # 是否创新高（略加缓冲避免噪点）
+    is_new_high = h > prev_high_max * 1.001
+
+    reasons = []
+
+    # 情况 1：有效突破（新高 + 强收盘 + 放量）
+    if is_new_high and c > (l + 0.75 * rng) and vol_ratio >= 1.2:
+        reasons.append("价格突破近期高点且收盘接近高位，成交量高于均值，突破相对有支撑。")
+        return {"label": "clean_breakout", "reasons": reasons}
+
+    # 情况 2：可能假突破（新高但收回、长上影、高位放量）
+    if is_new_high:
+        # 长上影 + 放量
+        if upper_shadow > max(body * 2, rng * 0.4) and vol_ratio >= 1.0:
+            reasons.append("出现高位长上影放量冲高回落，存在假突破或短线资金出货可能。")
+            return {"label": "possible_fake_breakout", "reasons": reasons}
+
+        # 新高但缩量
+        if vol_ratio < 0.8:
+            reasons.append("价格略创新高但成交量不足，突破动能偏弱。")
+            return {"label": "weak_breakout", "reasons": reasons}
+
+    # 情况 3：无明显突破，但有信息
+    if vol_ratio >= 1.5 and body < rng * 0.3 and upper_shadow > body and c < (l + 0.5 * rng):
+        reasons.append("放量但收盘偏弱，存在上方压力或分歧。")
+        return {"label": "possible_fake_breakout", "reasons": reasons}
+
+    if vol_ratio <= 0.7 and body < rng * 0.3:
+        reasons.append("缩量小实体K线，市场观望情绪较重。")
+
+    if not reasons:
+        reasons.append("量价关系未出现明显异常或突破信号，视为常规波动。")
+
+    return {"label": "normal", "reasons": reasons}
+
 
 def calculate_intelligent_position(signal_data, price_data, current_position):
     """计算智能仓位大小 - 修复版"""
@@ -1042,7 +1120,7 @@ def generate_technical_analysis_text(price_data):
     momentum_analysis_text = generate_momentum_analysis(price_data)
     boll_text = generate_bollinger_analysis(price_data)
     overheat = evaluate_overheat(price_data)
-
+    pvp = evaluate_price_volume_pattern(price_data)
 
     # 检查数据有效性
     def safe_float(value, default=0):
@@ -1069,6 +1147,10 @@ def generate_technical_analysis_text(price_data):
     【动能透支评估 - 系统辅助信息】
         - 当前透支等级: {overheat["level"]}
         - 参考信号: { "；".join(overheat["factors"]) if overheat["factors"] else "无明显透支信号" }
+    
+    【量价结构评估】
+        - 当前形态标签: {pvp['label']}
+        - 参考说明: {"；".join(pvp["reasons"]) if pvp.get("reasons") else "无明显异常信号"}
     """
     return analysis_text
 
@@ -1241,6 +1323,21 @@ def analyze_with_deepseek(price_data):
         - 当说明为“请忽略情绪信号”时，你在本次决策中应完全基于技术面与结构，不使用情绪作为加分项。
         - 不需要根据具体分钟数做机械判断，请根据说明语义综合考量。
 
+    【量价与突破信号使用原则】
+        - 你会看到一段【量价结构评估】，其中包含:
+            - 当前形态标签(label): clean_breakout / possible_fake_breakout / weak_breakout / normal
+            - 若干参考说明(reasons)。
+        - 当标签为 clean_breakout 时：
+            - 可以更信任当前突破的有效性，但仍需结合趋势与风险管理，不等于盲目追涨。
+        - 当标签为 possible_fake_breakout 或 weak_breakout 时：
+            - 请优先考虑这是一个需要谨慎对待的位置：
+                - 倾向降低做多信心、控制仓位，或选择观望；
+                - 如仍选择顺势参与，须在理由中清晰说明为何认为是假信号或风险可控。
+        - 当标签为 normal 时：
+            - 说明当前量价关系中性，你可以主要依据趋势、动量和结构来决策。
+        以上内容是供你参考的结构化线索，而不是机械规则。请在综合全部上下文后，给出有解释的交易判断。
+    
+    
     【交易指导原则 - 必须遵守】
     1. **技术分析主导** (权重60%)：趋势、支撑阻力、K线形态是主要依据
     3. **风险管理** (权重10%)：考虑持仓、盈亏状况和止损位置
