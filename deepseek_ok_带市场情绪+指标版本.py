@@ -617,15 +617,25 @@ def generate_bollinger_analysis(price_data, lookback: int = 40):
 
     return "\n".join(parts)
 
-def generate_price_action_tags(price_data: pd.DataFrame) -> list[str]:
+def generate_price_action_tags(price_data) -> list[str]:
     """
     基于本地K线数据生成形态/结构标签。
     仅输出中性标签，不做方向结论（假突破/冲顶等交给大模型判断）。
+    参数 price_data 可传入 DataFrame 或包含 'full_data' 的行情字典。
     """
-    if price_data is None or len(price_data) < 20:
+    if price_data is None:
         return []
 
-    df = price_data.copy()
+    if isinstance(price_data, pd.DataFrame):
+        df = price_data.copy()
+    else:
+        df = price_data.get("full_data") if isinstance(price_data, dict) else None
+        if df is not None:
+            df = df.copy()
+
+    if df is None or len(df) < 20:
+        return []
+
     df = df.sort_index()
 
     last = df.iloc[-1]
