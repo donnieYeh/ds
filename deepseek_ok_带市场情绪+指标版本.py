@@ -1130,6 +1130,33 @@ def create_fallback_signal(price_data):
         "is_fallback": True
     }
 
+def format_sentiment_text(sentiment_data):
+        if not sentiment_data:
+            return "【市场情绪】数据暂不可用"
+
+        sign = '+' if sentiment_data['net_sentiment'] >= 0 else ''
+        base = (
+            f"【市场情绪】乐观{sentiment_data['positive_ratio']:.1%} "
+            f"悲观{sentiment_data['negative_ratio']:.1%} "
+            f"净值{sign}{sentiment_data['net_sentiment']:.3f}"
+        )
+
+        delay = sentiment_data.get("data_delay_minutes", None)
+        if delay is None:
+            # 没有延迟信息就不多说
+            return base
+
+        # 新鲜度分级（本地机械逻辑）
+        if delay <= 15:
+            freshness = "（情绪数据较新，可作为辅助验证信号使用。）"
+        elif delay <= 45:
+            freshness = "（情绪数据存在一定延迟，仅作参考，不得单独作为交易依据。）"
+        elif delay <= 90:
+            freshness = "（情绪数据明显滞后，仅作背景信息，不应提升做多或做空信心。）"
+        else:
+            freshness = "（情绪数据严重滞后，本次决策请忽略情绪信号，专注技术面。）"
+
+        return base + " " + freshness
 
 def analyze_with_deepseek(price_data):
     """使用DeepSeek分析市场并生成交易信号（增强版）"""
@@ -1153,12 +1180,7 @@ def analyze_with_deepseek(price_data):
 
     # 获取情绪数据
     sentiment_data = get_sentiment_indicators_with_retry()
-    # 简化情绪文本 多了没用
-    if sentiment_data:
-        sign = '+' if sentiment_data['net_sentiment'] >= 0 else ''
-        sentiment_text = f"【市场情绪】乐观{sentiment_data['positive_ratio']:.1%} 悲观{sentiment_data['negative_ratio']:.1%} 净值{sign}{sentiment_data['net_sentiment']:.3f}"
-    else:
-        sentiment_text = "【市场情绪】数据暂不可用"
+    sentiment_text = format_sentiment_text(sentiment_data)
 
     # 添加当前持仓信息
     current_pos = get_current_position()
@@ -1211,14 +1233,16 @@ def analyze_with_deepseek(price_data):
         - 说明当前不存在明显透支信号，可以更专注于趋势与结构本身的判断。
 
         在任何情况下，请综合 K线结构、趋势、动量、布林带和情绪，不要因为“强势”或“单一信号”就给出激进决策。
-
+    
+    【情绪信号使用原则】
+        - 你会在【市场情绪】后面看到一段关于“数据是否新鲜”的说明（例如：数据较新 / 存在延迟 / 明显滞后 / 请忽略情绪）。
+        - 当说明为“数据较新”时，可以将情绪视为技术信号的辅助放大因素，前提是技术面本身合理。
+        - 当说明为“存在延迟”或“明显滞后”时，情绪只能作为背景信息，不得单独提高做多或做空的置信度。
+        - 当说明为“请忽略情绪信号”时，你在本次决策中应完全基于技术面与结构，不使用情绪作为加分项。
+        - 不需要根据具体分钟数做机械判断，请根据说明语义综合考量。
 
     【交易指导原则 - 必须遵守】
     1. **技术分析主导** (权重60%)：趋势、支撑阻力、K线形态是主要依据
-    2. **市场情绪辅助** (权重30%)：情绪数据用于验证技术信号，不能单独作为交易理由  
-        - 情绪与技术同向 → 增强信号信心
-        - 情绪与技术背离 → 以技术分析为主，情绪仅作参考
-        - 情绪数据延迟 → 降低权重，以实时技术指标为准
     3. **风险管理** (权重10%)：考虑持仓、盈亏状况和止损位置
     7. **技术指标权重**:
         - 趋势(均线排列) > RSI > MACD > 布林带
