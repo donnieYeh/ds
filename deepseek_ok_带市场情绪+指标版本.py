@@ -794,12 +794,21 @@ def estimate_rr_context(price_data, lookback: int = 40):
         current_price = float(recent["close"].iloc[-1])
         recent_high = float(recent["high"].max())
         recent_low = float(recent["low"].min())
+        if len(recent) > 1:
+            prior_high = float(recent["high"].iloc[:-1].max())
+            prior_low = float(recent["low"].iloc[:-1].min())
+        else:
+            prior_high = recent_high
+            prior_low = recent_low
     except Exception:
         return {
             "label": "unknown",
             "rr_value": None,
             "reason": "价格数据异常，未能评估风险回报结构。"
         }
+
+    is_new_high = current_price > prior_high
+    is_new_low = current_price < prior_low
 
     # 尝试读取已有关键位（如果你的 levels_analysis 有不同字段名，可在这里补充兼容）
     levels = (price_data.get("levels_analysis") or {}) if isinstance(price_data, dict) else {}
@@ -848,6 +857,14 @@ def estimate_rr_context(price_data, lookback: int = 40):
             nearest_resistance = None
 
     # 若关键位不可用或不合理，退化为区间位置法
+    if label == "unknown" and (not _valid(nearest_support) or not _valid(nearest_resistance)):
+        if is_new_high:
+            label = "balanced"
+            reasons.append("价格刷新近期高点，上方缺乏既有阻力位，后续空间取决于跟进力度，同时需警惕回踩风险。")
+        elif is_new_low:
+            label = "balanced"
+            reasons.append("价格跌破近期低点，下方缺乏既有支撑位，后续走势取决于抛压延续，同时需防范反抽风险。")
+
     if label == "unknown" and (not _valid(nearest_support) or not _valid(nearest_resistance)):
         rng = max(recent_high - recent_low, 1e-9)
         position = (current_price - recent_low) / rng  # 0=区间底，1=区间顶
@@ -1393,7 +1410,7 @@ def analyze_with_deepseek(price_data):
     【风险与仓位建议】
         - 根据系统输出的综合信号，合理判断信心等级（HIGH / MEDIUM / LOW）。
         - 当检测到透支、假突破或情绪滞后时，应降低仓位或选择 HOLD。
-        - 当信号一致且风险低时，可中等仓位参与，但仍应提供风险说明。
+        - 当信号一致且风险低时，可在对应方向中等仓位参与，但仍应提供风险说明。
         - 不需要引用历史持仓、盈亏或账户信息，它们不在模型输入范围内。
 
     【结构化辅助说明】
@@ -1405,18 +1422,18 @@ def analyze_with_deepseek(price_data):
 
     【趋势与风险平衡原则】
         1. 趋势优先，但要识别“透支风险”：
-            - 当短期与中期均线方向一致、价格沿多头方向运行时，可以优先考虑顺势交易。
-            - 但如果此时多项信号同时指向“行情可能已经接近阶段尾声”（例如：价格连续创高但动能放缓、动量指标处于高位区间、价格多次触及上轨附近等），你需要降低做多信心，而不是简单视为更强信号。
+            - 当短期与中期均线方向一致、价格沿同一方向运行时，可以优先考虑顺势交易（无论多空）。
+            - 但如果此时多项信号同时指向“行情可能已经接近阶段尾声”（例如：价格连续创高/创低但动能放缓、动量指标处于极值区间、价格多次触及通道边缘等），你需要降低顺势方向的信心，而不是简单视为更强信号。
         2. 请主动识别以下“可能透支”的组合特征（不限于固定阈值）：
-            - 价格处于近期波动区间的上沿或明显高位；
-            - 动量指标在高位但边际增量减弱（如MACD柱体缩短、RSI高位横盘等）；
-            - 突破后缺乏持续跟进（如放量冲高后回落、上影线明显等）。
+            - 价格处于近期波动区间的极端位置（上沿或下沿）；
+            - 动量指标在极值区域但边际增量减弱（如MACD柱体缩短、RSI在高位或低位横盘等）；
+            - 突破后缺乏持续跟进（如放量冲高后回落、放量杀跌后拉回、影线明显等）。
             遇到这些情况，你应更偏向：
                 - 降低信号置信度；
                 - 建议小仓或观望；
                 - 给出“等待更好入场位置”的理由。
-        3. 在趋势向上而无明显透支迹象时：
-            - 你可以给出BUY信号，并根据技术结构和波动环境给出合理的置信度和仓位建议。
+        3. 在趋势延续且无明显透支迹象时：
+            - 你可以给出与趋势同向的BUY或SELL信号，并根据技术结构和波动环境给出合理的置信度和仓位建议。
             - 不需要机械依赖某一个指标的单点阈值，而是综合评估多项信息的一致性与可持续性。
         4. 若技术信号之间存在明显冲突：
             - 例如：趋势看多，但多项信号提示可能见顶或动能衰减，
@@ -1428,15 +1445,15 @@ def analyze_with_deepseek(price_data):
 
         - 若 level = "strong":
         - 优先考虑这是阶段性高风险区域；
-        - 降低做多信心，倾向小仓或观望，而不是给出 HIGH 信心 BUY；
-        - 如仍认为可以做多，必须在理由中清晰说明为何当前结构仍支持顺势参与。
+        - 降低顺势信心，倾向小仓或观望，而不是给出 HIGH 信心的单边信号；
+        - 如仍认为可以顺势操作，必须在理由中清晰说明为何当前结构仍支持继续跟进。
 
         - 若 level = "mild":
-        - 说明部分高位或动能放缓迹象，需要更谨慎评估；
-        - 可以给出 BUY，但不应简单视为“无脑强势”，应考虑更合理的仓位与保护。
+        - 说明部分极值或动能放缓迹象，需要更谨慎评估；
+        - 可以给出顺势信号（BUY/SELL），但不应简单视为“无脑强势”，应考虑更合理的仓位与保护。
 
         - 若 level = "none":
-        - 说明当前不存在明显透支信号，可以更专注于趋势与结构本身的判断。
+        - 说明当前不存在明显透支信号，可以更专注于趋势与结构本身的判断，无论是看多还是看空。
 
         在任何情况下，请综合 K线结构、趋势、动量、布林带和情绪，不要因为“强势”或“单一信号”就给出激进决策。
     
@@ -1452,10 +1469,10 @@ def analyze_with_deepseek(price_data):
             - 当前形态标签(label): clean_breakout / possible_fake_breakout / weak_breakout / normal
             - 若干参考说明(reasons)。
         - 当标签为 clean_breakout 时：
-            - 可以更信任当前突破的有效性，但仍需结合趋势与风险管理，不等于盲目追涨。
+            - 可以更信任当前突破的有效性，但仍需结合趋势与风险管理，不等于盲目追涨或杀跌。
         - 当标签为 possible_fake_breakout 或 weak_breakout 时：
             - 请优先考虑这是一个需要谨慎对待的位置：
-                - 倾向降低做多信心、控制仓位，或选择观望；
+                - 倾向降低顺势信心、控制仓位，或选择观望；
                 - 如仍选择顺势参与，须在理由中清晰说明为何认为是假信号或风险可控。
         - 当标签为 normal 时：
             - 说明当前量价关系中性，你可以主要依据趋势、动量和结构来决策。
