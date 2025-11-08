@@ -503,6 +503,113 @@ def generate_momentum_analysis(price_data):
 
     return text
 
+def generate_bollinger_analysis(price_data, lookback: int = 40):
+    """
+    基于 price_data 中已计算好的布林带数据，生成给 LLM 用的布林带语义分析。
+
+    依赖:
+        price_data['technical_data']:
+            - bb_upper, bb_lower, bb_position
+        price_data['full_data'] (可选，用于带宽压缩/扩张判断):
+            - bb_upper, bb_lower, bb_middle
+
+    不重新计算技术指标，只做解释与归纳。
+    """
+
+    if not price_data or "technical_data" not in price_data:
+        return "🎚️ 布林带分析：缺少布林带相关数据，暂无法评估波动区间与相对位置。"
+
+    tech = price_data["technical_data"]
+    bb_pos = tech.get("bb_position")
+    bb_upper = tech.get("bb_upper")
+    bb_lower = tech.get("bb_lower")
+    rsi = tech.get("rsi")
+
+    # 基础可用性检查
+    if bb_pos is None or bb_upper is None or bb_lower is None:
+        return "🎚️ 布林带分析：布林带数据不完整，暂不将其作为本周期的主要决策依据。"
+
+    try:
+        bb_pos = float(bb_pos)
+        bb_upper = float(bb_upper)
+        bb_lower = float(bb_lower)
+    except (TypeError, ValueError):
+        return "🎚️ 布林带分析：布林带数据异常，无法给出可靠评估。"
+
+    parts = ["🎚️ 布林带分析："]
+
+    # === 1️⃣ 相对位置解读（使用已给出的 bb_position） ===
+    # bb_position = (price - lower) / (upper - lower)
+    if bb_pos <= 0.1:
+        pos_desc = "价格贴近下轨，处于相对偏弱/可能超卖区域。"
+        zone = "下轨附近"
+    elif bb_pos <= 0.3:
+        pos_desc = "价格位于布林带下半区，偏弱整理或下行趋势中。"
+        zone = "下半区"
+    elif bb_pos < 0.7:
+        pos_desc = "价格接近中轨附近，属于相对均衡/震荡区域。"
+        zone = "中部区域"
+    elif bb_pos < 0.9:
+        pos_desc = "价格位于布林带上半区，表现为偏强运行，多头占优。"
+        zone = "上半区"
+    else:
+        pos_desc = "价格贴近上轨，短期多头情绪较强，可能存在阶段性过热风险。"
+        zone = "上轨附近"
+
+    parts.append(f"- 当前位置：约处于区间的 {bb_pos * 100:.2f}%，即{zone}。{pos_desc}")
+
+    # === 2️⃣ 带宽与波动强度（利用 full_data，不做新指标，只对现有列做差） ===
+    width_desc = "带宽数据不足，暂不评估波动压缩或扩张。"
+    df = price_data.get("full_data")
+
+    try:
+        if df is not None and all(col in df.columns for col in ["bb_upper", "bb_lower", "bb_middle"]):
+            recent = df.tail(max(lookback, 20)).copy()
+            # 避免除零，仅在中轨有效时计算
+            recent["bb_width_ratio"] = (recent["bb_upper"] - recent["bb_lower"]) / recent["bb_middle"].replace(0, float("nan"))
+            current_row = recent.iloc[-1]
+            current_width = float(current_row["bb_width_ratio"]) if pd.notna(current_row["bb_width_ratio"]) else None
+            avg_width = float(recent["bb_width_ratio"].dropna().mean()) if not recent["bb_width_ratio"].dropna().empty else None
+
+            if current_width is not None and avg_width is not None:
+                if current_width < avg_width * 0.7:
+                    width_desc = "当前布林带明显收窄，波动被压缩，后续存在放量突破或单边行情的潜在风险。"
+                elif current_width > avg_width * 1.3:
+                    width_desc = "当前布林带显著张口，波动放大，多为空头或多头趋势演绎阶段，应重视顺势交易。"
+                else:
+                    width_desc = "当前布林带带宽接近近期均值，波动水平正常，无明显压缩或极端放大信号。"
+
+    except Exception:
+        # 容错，保持默认描述
+        pass
+
+    parts.append(f"- 波动带宽评估：{width_desc}")
+
+    # === 3️⃣ 与 RSI 的联合信号（只读已有 RSI，不计算） ===
+    overall = None
+    try:
+        if rsi is not None:
+            rsi = float(rsi)
+            if bb_pos >= 0.9 and rsi >= 70:
+                overall = "综合判断：价格贴近上轨且 RSI 超买，短期存在回调或整理压力，追高需控制仓位与杠杆。"
+            elif bb_pos <= 0.1 and rsi <= 30:
+                overall = "综合判断：价格贴近下轨且 RSI 超卖，存在技术性反弹或短线修复机会，但需结合趋势确认。"
+            elif 0.3 < bb_pos < 0.7 and 40 <= rsi <= 60:
+                overall = "综合判断：价格与 RSI 均处于中性区间，更偏向震荡市特征，适合等待突破信号。"
+
+    except (TypeError, ValueError):
+        pass
+
+    if not overall:
+        overall = "综合判断：布林带当前更多提供价格相对位置与波动信息，应与趋势结构（均线）、MACD、RSI 等联合使用，不单独作为开仓或反手依据。"
+
+    parts.append(f"- {overall}")
+
+    # 风控导向，避免 LLM 把“上轨/下轨”当成机械反转信号
+    parts.append("- 提示：价格触及或接近布林带上下轨，并不自动等于反转信号，更重要的是结合成交量、趋势方向和其他指标确认。")
+
+    return "\n".join(parts)
+
 
 def calculate_intelligent_position(signal_data, price_data, current_position):
     """计算智能仓位大小 - 修复版"""
@@ -849,6 +956,7 @@ def generate_technical_analysis_text(price_data):
     levels = price_data.get('levels_analysis', {})
     sma_analysis_text = generate_sma_analysis(price_data)
     momentum_analysis_text = generate_momentum_analysis(price_data)
+    boll_text = generate_bollinger_analysis(price_data)
 
     # 检查数据有效性
     def safe_float(value, default=0):
@@ -866,7 +974,7 @@ def generate_technical_analysis_text(price_data):
 
     {momentum_analysis_text}
 
-    🎚️ 布林带位置: {safe_float(tech['bb_position']):.2%} ({'上部' if safe_float(tech['bb_position']) > 0.7 else '下部' if safe_float(tech['bb_position']) < 0.3 else '中部'})
+    {boll_text}
 
     💰 关键水平:
     - 静态阻力: {safe_float(levels.get('static_resistance', 0)):.2f}
@@ -941,11 +1049,11 @@ def analyze_with_deepseek(price_data):
 
     # 构建K线数据文本
     recent_n = TRADE_CONFIG.get('recent_kline_count', 20)
-    kline_text = f"【最近{recent_n}根{TRADE_CONFIG['timeframe']}K线数据(K线20为最新数据)】\n"
+    kline_text = f"【最近{recent_n}根{TRADE_CONFIG['timeframe']}K线数据(K线{recent_n}为最新数据)】\n"
     for i, kline in enumerate(price_data['kline_data'][-recent_n:]):
         trend = "阳线" if kline['close'] > kline['open'] else "阴线"
         change = ((kline['close'] - kline['open']) / kline['open']) * 100
-        kline_text += f"K线{i + 1}: {trend} 开盘:{kline['open']:.2f} 收盘:{kline['close']:.2f} 涨跌:{change:+.2f}%\n"
+        kline_text += f"    K线{i + 1}: {trend} 开盘:{kline['open']:.2f} 收盘:{kline['close']:.2f} 涨跌:{change:+.2f}%\n"
 
     # 添加上次交易信号
     signal_text = ""
