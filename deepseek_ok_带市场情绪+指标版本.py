@@ -1014,122 +1014,223 @@ def evaluate_price_volume_pattern(price_data, lookback: int = 20):
 
     return {"label": "normal", "reasons": reasons}
 
-def estimate_rr_context(price_data, lookback: int = 40):
+def compute_risk_reward_for_sides(price_data: pd.DataFrame,
+                                  lookback: int = 96,
+                                  recent_exclude: int = 8,
+                                  breakout_eps: float = 0.001) -> dict:
     """
-    基于近期波动区间与已有支撑阻力，给出当前多空操作的结构性风险回报评估。
+    基于最近一段结构，分别评估做多与做空方向的区间型风险回报。
+    显式区分：
+    - 区间内交易（range mode）
+    - 向上/向下突破后的交易（breakout mode）
 
-    说明：
-    - 仅作为供大模型参考的特征，不直接做开平仓决策。
-    - 优先使用 levels_analysis 中的最近支撑/阻力；
-      若缺失，则退化为最近 lookback 根K线的高低区间。
+    返回:
+    {
+        "mode": "range" | "up_breakout" | "down_breakout",
+        "long":  {...},
+        "short": {...},
+    }
     """
-    df = price_data.get("full_data")
-    if df is None or len(df) < max(20, lookback):
+
+    if price_data is None or len(price_data) < (lookback + recent_exclude + 5):
         return {
-            "label": "unknown",
-            "rr_value": None,
-            "reason": "K线样本不足，暂不提供风险回报结构评估。"
+            "mode": "range",
+            "long":  {"tag": "unknown", "ratio": None, "reason": "样本不足，无法稳定评估风险回报结构"},
+            "short": {"tag": "unknown", "ratio": None, "reason": "样本不足，无法稳定评估风险回报结构"},
         }
 
-    recent = df.tail(lookback)
-    try:
-        current_price = float(recent["close"].iloc[-1])
-        recent_high = float(recent["high"].max())
-        recent_low = float(recent["low"].min())
-        if len(recent) > 1:
-            prior_high = float(recent["high"].iloc[:-1].max())
-            prior_low = float(recent["low"].iloc[:-1].min())
+    df = price_data.copy()
+    df = df.iloc[-(lookback + recent_exclude):]  # 保留需要的窗口
+    recent = df.iloc[-recent_exclude:]
+    base = df.iloc[:-recent_exclude]             # 用于定义“原始区间”
+
+    prev_high = float(base["high"].max())
+    prev_low = float(base["low"].min())
+    current = float(recent["close"].iloc[-1])
+
+    base_range = max(prev_high - prev_low, 1e-8)
+
+    # --- 检测突破状态 ---
+    up_break = current > prev_high * (1 + breakout_eps)
+    down_break = current < prev_low * (1 - breakout_eps)
+
+    def _tag(r: float) -> str:
+        if r >= 2.0:
+            return "favorable"
+        elif r >= 1.0:
+            return "neutral"
+        elif r > 0:
+            return "unfavorable"
         else:
-            prior_high = recent_high
-            prior_low = recent_low
-    except Exception:
+            return "unknown"
+
+    # === 情况1：向上突破（up_breakout mode） ===
+    if up_break:
+        # 假设：上破有效，多头止损放在 prev_high 下方，目标以“原区间高度的测幅”估计
+        breakout_level = prev_high
+        projected_target = breakout_level + base_range  # 机械测幅，非预测，只给结构参考
+
+        risk_long = max(current - breakout_level, 1e-8)
+        reward_long = max(projected_target - current, 0.0)
+        ratio_long = reward_long / risk_long if reward_long > 0 else 0.0
+
+        # 逆势做空：视为结构上不利或高度不确定
+        # 不给它“看起来很香”的R:R，避免误导
+        risk_short = max(projected_target - current, 1e-8)
+        reward_short = max(current - breakout_level, 0.0)
+        ratio_short = reward_short / risk_short if reward_short > 0 else 0.0
+
         return {
-            "label": "unknown",
-            "rr_value": None,
-            "reason": "价格数据异常，未能评估风险回报结构。"
+            "mode": "up_breakout",
+            "long": {
+                "tag": _tag(ratio_long),
+                "ratio": round(ratio_long, 2),
+                "reason": (
+                    f"价格已明显上破前高区间（{prev_low:.1f}~{prev_high:.1f}），"
+                    f"多头参考以前高作为止损附近位置，以原区间高度做测幅，"
+                    f"当前上破后的结构性R:R约为 {ratio_long:.2f}。"
+                ),
+            },
+            "short": {
+                # 这里直接把大部分情况压成不利/未知
+                "tag": "unfavorable" if ratio_short < 1.0 else "neutral",
+                "ratio": round(ratio_short, 2),
+                "reason": (
+                    "当前处于上破区间后的高位，逆势做空属于反趋势博弈，"
+                    "即使短线R:R看似可观，也不应视为结构性优势，仅在多因子强烈反转信号下谨慎考虑。"
+                ),
+            },
         }
 
-    is_new_high = current_price > prior_high
-    is_new_low = current_price < prior_low
+    # === 情况2：向下突破（down_breakout mode） ===
+    if down_break:
+        breakout_level = prev_low
+        projected_target = breakout_level - base_range
 
-    # 尝试读取已有关键位（如果你的 levels_analysis 有不同字段名，可在这里补充兼容）
-    levels = (price_data.get("levels_analysis") or {}) if isinstance(price_data, dict) else {}
-    nearest_support = levels.get("nearest_support") or levels.get("support") or None
-    nearest_resistance = levels.get("nearest_resistance") or levels.get("resistance") or None
+        risk_short = max(breakout_level - current, 1e-8)
+        reward_short = max(current - projected_target, 0.0)
+        ratio_short = reward_short / risk_short if reward_short > 0 else 0.0
 
-    # 用关键位算结构性 R:R
-    rr_value = None
-    label = "unknown"
-    reasons = []
+        risk_long = max(current - projected_target, 1e-8)
+        reward_long = max(breakout_level - current, 0.0)
+        ratio_long = reward_long / risk_long if reward_long > 0 else 0.0
 
-    def _valid(x):
-        try:
-            return x is not None and float(x) > 0
-        except Exception:
-            return False
+        return {
+            "mode": "down_breakout",
+            "long": {
+                "tag": "unfavorable" if ratio_long < 1.0 else "neutral",
+                "ratio": round(ratio_long, 2),
+                "reason": (
+                    "当前处于下破区间后的低位，逆势做多属于反趋势博弈，"
+                    "结构上并不具备稳定优势，仅在出现明显止跌与多因子共振时才可谨慎评估。"
+                ),
+            },
+            "short": {
+                "tag": _tag(ratio_short),
+                "ratio": round(ratio_short, 2),
+                "reason": (
+                    f"价格已明显跌破前低区间（{prev_low:.1f}~{prev_high:.1f}），"
+                    f"空头参考以前低作为止损上方区域，以原区间高度做测幅，"
+                    f"当前下破后的结构性R:R约为 {ratio_short:.2f}。"
+                ),
+            },
+        }
 
-    if _valid(nearest_support) and _valid(nearest_resistance):
-        nearest_support = float(nearest_support)
-        nearest_resistance = float(nearest_resistance)
+    # === 情况3：未突破，正常区间内（range mode） ===
+    # 回到对称结构
+    current_range_high = float(df["high"].max())
+    current_range_low = float(df["low"].min())
+    current_range_span = max(current_range_high - current_range_low, 1e-8)
 
-        # 要求支撑在当前价下方、阻力在上方，否则说明当前就在极端位置
-        if nearest_support < current_price < nearest_resistance:
-            risk = current_price - nearest_support
-            reward = nearest_resistance - current_price
+    risk_long = max(current - current_range_low, 1e-8)
+    reward_long = max(current_range_high - current, 0.0)
+    ratio_long = reward_long / risk_long if reward_long > 0 else 0.0
 
-            if risk > 0 and reward > 0:
-                rr_value = reward / risk
-                # 标签逻辑：温和分层，不当铁律
-                if rr_value >= 2.0:
-                    label = "favorable"
-                    reasons.append("上方潜在空间明显大于下方风险，结构性R:R偏优。")
-                elif rr_value >= 1.2:
-                    label = "balanced"
-                    reasons.append("上方空间与下方风险大致接近，结构性R:R中性。")
-                else:
-                    label = "unfavorable"
-                    reasons.append("价格更靠近压力位，潜在收益相对有限，下行风险相对更大。")
-            else:
-                label = "unknown"
-                reasons.append("当前价格接近关键支撑或阻力，难以计算合理R:R。")
+    risk_short = max(current_range_high - current, 1e-8)
+    reward_short = max(current - current_range_low, 0.0)
+    ratio_short = reward_short / risk_short if reward_short > 0 else 0.0
 
-        else:
-            # 当前价已经非常接近/突破关键位，回落到区间逻辑
-            nearest_support = None
-            nearest_resistance = None
-
-    # 若关键位不可用或不合理，退化为区间位置法
-    if label == "unknown" and (not _valid(nearest_support) or not _valid(nearest_resistance)):
-        if is_new_high:
-            label = "balanced"
-            reasons.append("价格刷新近期高点，上方缺乏既有阻力位，后续空间取决于跟进力度，同时需警惕回踩风险。")
-        elif is_new_low:
-            label = "balanced"
-            reasons.append("价格跌破近期低点，下方缺乏既有支撑位，后续走势取决于抛压延续，同时需防范反抽风险。")
-
-    if label == "unknown" and (not _valid(nearest_support) or not _valid(nearest_resistance)):
-        rng = max(recent_high - recent_low, 1e-9)
-        position = (current_price - recent_low) / rng  # 0=区间底，1=区间顶
-
-        if position < 0.3:
-            label = "favorable"
-            reasons.append("价格位于近期波动区间偏下部，上行弹性相对更大。")
-        elif position > 0.7:
-            label = "unfavorable"
-            reasons.append("价格位于近期区间偏上部，下行回撤风险更大。")
-        else:
-            label = "balanced"
-            reasons.append("价格位于区间中部，风险与潜在收益相对均衡。")
-
-    if not reasons:
-        reasons.append("量价与关键位信息有限，风险回报结构偏中性处理。")
+    long_pct_risk = risk_long / current_range_span
+    long_pct_reward = reward_long / current_range_span
+    short_pct_risk = risk_short / current_range_span
+    short_pct_reward = reward_short / current_range_span
 
     return {
-        "label": label,            # 'favorable' / 'balanced' / 'unfavorable' / 'unknown'
-        "rr_value": rr_value,      # 可为 None，仅作参考展示
-        "reason": " ".join(reasons)
+        "mode": "range",
+        "long": {
+            "tag": _tag(ratio_long),
+            "ratio": round(ratio_long, 2),
+            "reason": (
+                f"当前价格位于近期区间内，做多参考区间低点作为风险边界，"
+                f"下方风险约占区间 {long_pct_risk:.1%}，上方空间约占 {long_pct_reward:.1%}。"
+            ),
+        },
+        "short": {
+            "tag": _tag(ratio_short),
+            "ratio": round(ratio_short, 2),
+            "reason": (
+                f"当前价格位于近期区间内，做空参考区间高点作为风险边界，"
+                f"上方风险约占区间 {short_pct_risk:.1%}，下方空间约占 {short_pct_reward:.1%}。"
+            ),
+        },
     }
 
+def _translate_rr_tag(tag: str) -> str:
+    mapping = {
+        "favorable": "相对有利",
+        "neutral": "中性",
+        "unfavorable": "相对不利",
+        "unknown": "信息不足",
+    }
+    return mapping.get(tag, "中性")
+
+def format_risk_reward_for_prompt(rr: dict, trend_summary: str | None = None) -> str:
+    """
+    将双向R:R结果转为给 LLM 的自然语言说明。
+    trend_summary 可选：可传入你已有的趋势描述，提示模型“优先参考顺势一侧”。
+    """
+    long_info = rr.get("long", {})
+    short_info = rr.get("short", {})
+
+    long_tag = _translate_rr_tag(long_info.get("tag"))
+    short_tag = _translate_rr_tag(short_info.get("tag"))
+
+    long_ratio = long_info.get("ratio")
+    short_ratio = short_info.get("ratio")
+
+    # 字符串兜底，避免 None 拼接出错
+    long_ratio_str = f"{long_ratio:.2f}" if isinstance(long_ratio, (int, float)) else "?"
+    short_ratio_str = f"{short_ratio:.2f}" if isinstance(short_ratio, (int, float)) else "?"
+
+    lines = [
+        "【风险回报结构】（多空分向评估，仅基于区间结构，不代表必然走势）"]
+    
+
+    mode = rr.get("mode", "range")
+
+    if mode == "up_breakout":
+        lines.append("- 当前处于上破区间后的延伸阶段，请优先从多头角度评估结构是否健康，逆势做空仅在强烈反转信号下考虑。")
+    elif mode == "down_breakout":
+        lines.append("- 当前处于下破区间后的延伸阶段，请优先从空头角度评估结构是否健康，逆势做多仅在强烈止跌信号下考虑。")
+    else:
+        lines.append("- 当前价格尚在近期震荡区间内，可对多空方向分别从区间上下沿角度评估R:R。")
+
+    # 然后附上 long/short 的 tag、ratio、reason（保持我们上版风格）
+
+    lines += [
+        f"- 做多方向: {long_tag}（理论R:R≈{long_ratio_str}），{long_info.get('reason', '')}",
+        f"- 做空方向: {short_tag}（理论R:R≈{short_ratio_str}），{short_info.get('reason', '')}",
+        "",
+        "使用指引：",
+        "1. 优先结合当前趋势方向，参考与趋势同向一侧的风险回报；",
+        "2. 若某一方向为“相对不利”，仅在多因子强烈共振时才考虑；",
+        "3. 该评估不包含你的主观预测，仅提供区间结构上的风险/空间对比。",
+    ]
+
+    if trend_summary:
+        lines.append(f"4. 当前趋势概览：{trend_summary.strip()}")
+
+    return "\n".join(lines)
 
 def calculate_intelligent_position(signal_data, price_data, current_position):
     """计算智能仓位大小 - 修复版"""
@@ -1479,17 +1580,8 @@ def generate_technical_analysis_text(price_data):
     boll_text = generate_bollinger_analysis(price_data)
     overheat = evaluate_overheat(price_data)
     pvp = evaluate_price_volume_pattern(price_data)
-    rr_info = estimate_rr_context(price_data)
-
-    rr_text = (
-        "【风险回报评估】\n"
-        f"- 当前结构标签: {rr_info['label']}\n"
-        f"- 参考说明: {rr_info['reason']}\n"
-    )
-
-    if rr_info.get("rr_value") is not None:
-        rr_text += f"- 结构性R:R参考值: 约 {rr_info['rr_value']:.2f}:1（仅作结构参考，并非精确测算）。\n"
-
+    risk_reward = compute_risk_reward_for_sides(price_data)
+    risk_reward_text = format_risk_reward_for_prompt(risk_reward, trend_summary=None)
 
     # 检查数据有效性
     def safe_float(value, default=0):
@@ -1521,7 +1613,7 @@ def generate_technical_analysis_text(price_data):
         - 当前形态标签: {pvp['label']}
         - 参考说明: {"；".join(pvp["reasons"]) if pvp.get("reasons") else "无明显异常信号"}
 
-    {rr_text}
+    {risk_reward_text}
     """
     return analysis_text
 
