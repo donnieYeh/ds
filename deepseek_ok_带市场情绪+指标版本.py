@@ -610,6 +610,248 @@ def generate_bollinger_analysis(price_data, lookback: int = 40):
 
     return "\n".join(parts)
 
+def generate_price_action_tags(price_data: pd.DataFrame) -> list[str]:
+    """
+    基于本地K线数据生成形态/结构标签。
+    仅输出中性标签，不做方向结论（假突破/冲顶等交给大模型判断）。
+    """
+    if price_data is None or len(price_data) < 20:
+        return []
+
+    df = price_data.copy()
+    df = df.sort_index()
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    tags = set()
+    tags.update(_single_candle_tags(df, last, prev))
+    tags.update(_sequence_tags(df))
+    tags.update(_range_break_tags(df))
+    tags.update(_volatility_tags(df))
+
+    return sorted(tags)
+
+def _single_candle_tags(df: pd.DataFrame, last, prev) -> list[str]:
+    tags = []
+
+    o, h, l, c = float(last['open']), float(last['high']), float(last['low']), float(last['close'])
+    body = abs(c - o)
+    full_range = max(h - l, 1e-9)
+    upper = h - max(o, c)
+    lower = min(o, c) - l
+
+    body_ma_window = min(20, len(df))
+    body_ma = (df['close'].iloc[-body_ma_window:] - df['open'].iloc[-body_ma_window:]).abs().mean()
+
+    # 长上下影 & Doji & 大实体
+    if upper >= max(2 * body, 0.4 * full_range) and body / full_range <= 0.6:
+        tags.append("LONG_UPPER_SHADOW")
+    if lower >= max(2 * body, 0.4 * full_range) and body / full_range <= 0.6:
+        tags.append("LONG_LOWER_SHADOW")
+    if body_ma > 0 and body >= 1.5 * body_ma:
+        tags.append("BIG_BODY")
+    if body <= 0.2 * full_range and full_range >= 0.5 * body_ma:
+        tags.append("SMALL_BODY_DOJI")
+
+    # 吞没候选（仅做线索）
+    po, ph, pl, pc = float(prev['open']), float(prev['high']), float(prev['low']), float(prev['close'])
+    prev_body = abs(pc - po)
+
+    # 看多吞没候选
+    if c > o and pc < po and body > prev_body and l <= pl and c >= ph:
+        tags.append("BULLISH_ENGULFING_CANDIDATE")
+
+    # 看空吞没候选
+    if c < o and pc > po and body > prev_body and h >= ph and c <= pl:
+        tags.append("BEARISH_ENGULFING_CANDIDATE")
+
+    return tags
+def _sequence_tags(df: pd.DataFrame) -> list[str]:
+    tags = []
+    closes = df['close']
+    highs = df['high']
+    lows = df['low']
+
+    # 连续涨跌（取最近5根内的极值）
+    max_lookback = min(5, len(df) - 1)
+    up_streak = 0
+    down_streak = 0
+    for i in range(1, max_lookback + 1):
+        if closes.iloc[-i] > closes.iloc[-i-1]:
+            up_streak += 1
+            if down_streak > 0:
+                break
+        elif closes.iloc[-i] < closes.iloc[-i-1]:
+            down_streak += 1
+            if up_streak > 0:
+                break
+        else:
+            break
+
+    if up_streak >= 3:
+        tags.append(f"N_CONSECUTIVE_UP_{up_streak}")
+    if down_streak >= 3:
+        tags.append(f"N_CONSECUTIVE_DOWN_{down_streak}")
+
+    # 高点/低点序列（简单3段结构）
+    if len(df) >= 4:
+        recent_highs = highs.iloc[-4:]
+        recent_lows = lows.iloc[-4:]
+
+        if all(recent_highs.iloc[i] < recent_highs.iloc[i+1] for i in range(3)):
+            tags.append("HIGHER_HIGH_SERIES_3")
+        if all(recent_lows.iloc[i] > recent_lows.iloc[i+1] for i in range(3)):
+            tags.append("LOWER_LOW_SERIES_3")
+
+    # 动能加速：最近5根实体对比前20根
+    if len(df) >= 25:
+        recent_body = (df['close'].iloc[-5:] - df['open'].iloc[-5:]).abs().mean()
+        hist_body = (df['close'].iloc[-25:-5] - df['open'].iloc[-25:-5]).abs().mean()
+        if hist_body > 0:
+            ratio = recent_body / hist_body
+            if ratio >= 1.6:
+                # 方向中性，交给模型从趋势+价格判断多空
+                tags.append("MOMENTUM_ACCELERATION_STRONG")
+            elif ratio >= 1.3:
+                tags.append("MOMENTUM_ACCELERATION_MILD")
+
+    return tags
+def _range_break_tags(df: pd.DataFrame) -> list[str]:
+    tags = []
+    closes = df['close']
+    highs = df['high']
+    lows = df['low']
+
+    last_close = float(closes.iloc[-1])
+    last_high = float(highs.iloc[-1])
+    last_low = float(lows.iloc[-1])
+
+    # 短&中区间
+    short_n = min(48, len(df))
+    mid_n = min(144, len(df))
+
+    short_high = float(highs.iloc[-short_n:].max())
+    short_low = float(lows.iloc[-short_n:].min())
+    mid_high = float(highs.iloc[-mid_n:].max())
+    mid_low = float(lows.iloc[-mid_n:].min())
+
+    # 相对距离（永续合约，这里用百分比）
+    def rel(x, y):
+        return abs(x - y) / max(y, 1e-9)
+
+    # 贴近区间边缘
+    if rel(last_close, short_high) <= 0.003:
+        tags.append("NEAR_SHORT_RANGE_HIGH")
+    if rel(last_close, short_low) <= 0.003:
+        tags.append("NEAR_SHORT_RANGE_LOW")
+
+    # 短区间突破
+    if last_close > short_high * 1.001:
+        tags.append("BREAK_ABOVE_SHORT_RANGE_HIGH")
+    if last_close < short_low * 0.999:
+        tags.append("BREAK_BELOW_SHORT_RANGE_LOW")
+
+    # 假突破嫌疑特征（仍是“嫌疑”，不是结论）
+    # 上破后长上影/收回区间附近
+    if "BREAK_ABOVE_SHORT_RANGE_HIGH" in tags:
+        upper_shadow = last_high - max(float(df['open'].iloc[-1]), last_close)
+        body = abs(last_close - float(df['open'].iloc[-1]))
+        full_range = max(last_high - last_low, 1e-9)
+
+        if upper_shadow >= max(2 * body, 0.4 * full_range) or last_close <= short_high * 1.0015:
+            tags.append("BREAKUP_WEAK_FOLLOWTHROUGH_HINT")
+
+    if "BREAK_BELOW_SHORT_RANGE_LOW" in tags:
+        lower_shadow = min(float(df['open'].iloc[-1]), last_close) - last_low
+        body = abs(last_close - float(df['open'].iloc[-1]))
+        full_range = max(last_high - last_low, 1e-9)
+
+        if lower_shadow >= max(2 * body, 0.4 * full_range) or last_close >= short_low * 0.9985:
+            tags.append("BREAKDOWN_WEAK_FOLLOWTHROUGH_HINT")
+
+    return tags
+def _volatility_tags(df: pd.DataFrame) -> list[str]:
+    tags = []
+    if len(df) < 40:
+        return tags
+
+    hl = df['high'] - df['low']
+
+    recent_n = 20
+    base_n = 60
+
+    recent_vol = hl.iloc[-recent_n:].mean()
+    base_vol = hl.iloc[-base_n:-recent_n].mean() if len(df) >= base_n + recent_n else hl.iloc[:-recent_n].mean()
+
+    if base_vol <= 0:
+        return tags
+
+    ratio = recent_vol / base_vol
+
+    if ratio <= 0.6:
+        tags.append("VOLATILITY_SQUEEZE")
+    elif ratio >= 1.6:
+        tags.append("VOLATILITY_EXPANSION")
+
+    return tags
+def format_price_action_tags_for_llm(tags: list[str]) -> str:
+    """
+    将本地形态/结构标签转换为 LLM 友好的简要文字描述。
+    要求：
+    - 简短
+    - 中性
+    - 不下交易结论，只描述结构线索
+    """
+    if not tags:
+        return "未检测到特别突出的K线形态或价格结构信号，本地特征提取保持中性。"
+
+    desc_map = {
+        # 单根K线
+        "LONG_UPPER_SHADOW": "当前K线出现相对明显的长上影，上方抛压或获利了结迹象增加。",
+        "LONG_LOWER_SHADOW": "当前K线出现相对明显的长下影，下方承接或买盘支撑迹象增加。",
+        "BIG_BODY": "当前K线实体显著大于近期平均，短线方向性波动放大。",
+        "SMALL_BODY_DOJI": "当前K线实体较小，短线方向犹豫，等待进一步选择。",
+        "BULLISH_ENGULFING_CANDIDATE": "出现潜在多头吞没形态候选，短线多头尝试主导节奏。",
+        "BEARISH_ENGULFING_CANDIDATE": "出现潜在空头吞没形态候选，短线空头尝试主导节奏。",
+
+        # 连续结构 / 动能
+        "MOMENTUM_ACCELERATION_STRONG": "近期K线实体整体明显放大，相比过去存在较强动能加速迹象。",
+        "MOMENTUM_ACCELERATION_MILD": "近期K线实体略有放大，存在一定动能增强迹象。",
+
+        # 区间/突破
+        "NEAR_SHORT_RANGE_HIGH": "当前价格逼近近期短周期震荡区间上沿位置。",
+        "NEAR_SHORT_RANGE_LOW": "当前价格逼近近期短周期震荡区间下沿位置。",
+        "BREAK_ABOVE_SHORT_RANGE_HIGH": "价格向上突破近期短周期区间上沿，有上攻延伸的尝试。",
+        "BREAK_BELOW_SHORT_RANGE_LOW": "价格向下跌破近期短周期区间下沿，有下探延伸的尝试。",
+        "BREAKUP_WEAK_FOLLOWTHROUGH_HINT": "上破后跟随力度相对有限，存在动能衰减或假突破的结构疑虑。",
+        "BREAKDOWN_WEAK_FOLLOWTHROUGH_HINT": "下破后跟随力度相对有限，存在动能衰减或假跌破的结构疑虑。",
+
+        # 波动结构
+        "VOLATILITY_SQUEEZE": "近期波动率明显收缩，市场处于压缩整理阶段，潜在蓄势状态。",
+        "VOLATILITY_EXPANSION": "近期波动率明显放大，市场处于活跃波动阶段，方向博弈加剧。",
+    }
+
+    # 支持 N_CONSECUTIVE_UP_x / DOWN_x 动态文案
+    pretty_lines = []
+
+    for t in tags:
+        if t.startswith("N_CONSECUTIVE_UP_"):
+            n = t.split("_")[-1]
+            pretty_lines.append(f"近期出现连续 {n} 根收盘抬升的上涨序列，多头短线保持主动。")
+        elif t.startswith("N_CONSECUTIVE_DOWN_"):
+            n = t.split("_")[-1]
+            pretty_lines.append(f"近期出现连续 {n} 根收盘走低的下跌序列，空头短线保持主动。")
+        elif t in desc_map:
+            pretty_lines.append(desc_map[t])
+        # 未映射的标签静默忽略或保留原名（建议忽略，避免噪音）
+
+    if not pretty_lines:
+        return "存在部分结构标签触发，但整体信号不具备单独解释意义，请综合其他因子评估。"
+
+    return "\n".join(f"- {line}" for line in pretty_lines)
+
+
 def evaluate_overheat(price_data):
     """
     基于已有技术数据，给出一个“动能是否可能透支”的评估结果。
@@ -1376,12 +1618,14 @@ def analyze_with_deepseek(price_data):
     technical_analysis = generate_technical_analysis_text(price_data)
 
     # 构建K线数据文本
-    recent_n = TRADE_CONFIG.get('recent_kline_count', 20)
-    kline_text = f"【最近{recent_n}根{TRADE_CONFIG['timeframe']}K线数据(K线{recent_n}为最新数据)】\n"
-    for i, kline in enumerate(price_data['kline_data'][-recent_n:]):
-        trend = "阳线" if kline['close'] > kline['open'] else "阴线"
-        change = ((kline['close'] - kline['open']) / kline['open']) * 100
-        kline_text += f"    K线{i + 1}: {trend} 开盘:{kline['open']:.2f} 收盘:{kline['close']:.2f} 涨跌:{change:+.2f}%\n"
+    # recent_n = TRADE_CONFIG.get('recent_kline_count', 20)
+    # kline_text = f"【最近{recent_n}根{TRADE_CONFIG['timeframe']}K线数据(K线{recent_n}为最新数据)】\n"
+    # for i, kline in enumerate(price_data['kline_data'][-recent_n:]):
+    #     trend = "阳线" if kline['close'] > kline['open'] else "阴线"
+    #     change = ((kline['close'] - kline['open']) / kline['open']) * 100
+    #     kline_text += f"    K线{i + 1}: {trend} 开盘:{kline['open']:.2f} 收盘:{kline['close']:.2f} 涨跌:{change:+.2f}%\n"
+    price_action_tags = generate_price_action_tags(price_data)
+    price_action_text = "   【K线形态或价格结构信号】\n     " + format_price_action_tags_for_llm(price_action_tags)
 
     # 添加上次交易信号
     signal_text = ""
@@ -1439,6 +1683,13 @@ def analyze_with_deepseek(price_data):
             - 例如：趋势看多，但多项信号提示可能见顶或动能衰减，
             - 优先选择更保守的方案（降低置信度、小仓或HOLD），并在理由中说明冲突点。
 
+    【K线形态与结构线索使用原则】
+        将这些标签视为：
+            - 判断突破有效性/假突破嫌疑
+            - 判断冲顶/衰竭/趋势延续/震荡犹豫
+        的辅助证据，而不是机械信号。
+        如认为存在明显假突破或冲顶迹象，请在推理说明中指出“对应的标签依据”，并在最终JSON决策中体现你的判断。
+
     【动能透支处理原则】
         你会收到一段“动能透支评估 - 系统辅助信息”，其中包含 level（none/mild/strong）以及参考信号说明。
         请按以下方式理解和使用（这是思考方向，而不是死规则）：
@@ -1494,7 +1745,7 @@ def analyze_with_deepseek(price_data):
     
     ---------------以下是实盘数据部分-------------------------
 
-    {kline_text}
+    {price_action_text}
 
     {technical_analysis}
 
