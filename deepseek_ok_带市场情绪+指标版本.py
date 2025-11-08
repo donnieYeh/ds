@@ -1078,23 +1078,6 @@ def analyze_with_deepseek(price_data):
     prompt = f"""
     你是一个专业的加密货币交易分析师。请基于以下{get_human_pair()} {TRADE_CONFIG['timeframe']}周期数据进行分析：
 
-    {kline_text}
-
-    {technical_analysis}
-
-    {signal_text}
-
-    {sentiment_text}  # 添加情绪分析
-
-    【当前行情】
-    - 当前价格: ${price_data['price']:,.2f}
-    - 时间: {price_data['timestamp']}
-    - 本K线最高: ${price_data['high']:,.2f}
-    - 本K线最低: ${price_data['low']:,.2f}
-    - 本K线成交量: {price_data['volume']:.2f} {get_contract_unit_name()}
-    - 价格变化: {price_data['price_change']:+.2f}%
-    - 当前持仓: {position_text}{pnl_text}
-
     【防频繁交易重要原则】
     1. **趋势持续性优先**: 不要因单根K线或短期波动改变整体趋势判断
     2. **持仓稳定性**: 除非趋势明确强烈反转，否则保持现有持仓方向
@@ -1117,13 +1100,6 @@ def analyze_with_deepseek(price_data):
     7. **技术指标权重**:
     - 趋势(均线排列) > RSI > MACD > 布林带
     - 价格突破关键支撑/阻力位是重要信号 
-
-
-    【当前技术状况分析】
-    - 整体趋势: {price_data['trend_analysis'].get('overall', 'N/A')}
-    - 短期趋势: {price_data['trend_analysis'].get('short_term', 'N/A')} 
-    - RSI状态: {price_data['technical_data'].get('rsi', 0):.1f} ({'超买' if price_data['technical_data'].get('rsi', 0) > 70 else '超卖' if price_data['technical_data'].get('rsi', 0) < 30 else '中性'})
-    - MACD方向: {price_data['trend_analysis'].get('macd', 'N/A')}
 
     【智能仓位管理规则 - 必须遵守】
 
@@ -1149,7 +1125,7 @@ def analyze_with_deepseek(price_data):
     【重要】请基于技术分析做出明确判断，避免因过度谨慎而错过趋势行情！
 
     【分析要求】
-    基于以上分析，请给出明确的交易信号
+    基于以上规则，结合后续我提供的实盘数据，请给出明确的交易信号
 
     请用以下JSON格式回复：
     {{
@@ -1159,6 +1135,26 @@ def analyze_with_deepseek(price_data):
         "take_profit": 具体价格, 
         "confidence": "HIGH|MEDIUM|LOW"
     }}
+    
+    ---------------以下是实盘数据部分-------------------------
+
+    {kline_text}
+
+    {technical_analysis}
+
+    {signal_text}
+
+    {sentiment_text}  # 添加情绪分析
+
+    【当前行情】
+    - 当前价格: ${price_data['price']:,.2f}
+    - 时间: {price_data['timestamp']}
+    - 本K线最高: ${price_data['high']:,.2f}
+    - 本K线最低: ${price_data['low']:,.2f}
+    - 本K线成交量: {price_data['volume']:.2f} {get_contract_unit_name()}
+    - 价格变化: {price_data['price_change']:+.2f}%
+    - 当前持仓: {position_text}{pnl_text}
+
     """
 
     # 可选打印构造的Prompt，便于调试与复查
