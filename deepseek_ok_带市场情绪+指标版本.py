@@ -1021,8 +1021,8 @@ def evaluate_price_volume_pattern(price_data, lookback: int = 20):
 
     return {"label": "normal", "reasons": reasons}
 
-def compute_risk_reward_for_sides(price_data: pd.DataFrame,
-                                  lookback: int = 50,
+def compute_risk_reward_for_sides(price_data,
+                                  lookback: int = 80,
                                   recent_exclude: int = 8,
                                   breakout_eps: float = 0.001) -> dict:
     """
@@ -1037,16 +1037,30 @@ def compute_risk_reward_for_sides(price_data: pd.DataFrame,
         "long":  {...},
         "short": {...},
     }
+    参数 price_data 可直接传入包含 OHLCV 列的 DataFrame，或是包含 'full_data' 键的行情字典。
     """
 
-    if price_data is None or len(price_data) < (lookback + recent_exclude + 5):
+    if price_data is None:
+        return {
+            "mode": "range",
+            "long":  {"tag": "unknown", "ratio": None, "reason": "缺少K线数据，无法评估风险回报结构"},
+            "short": {"tag": "unknown", "ratio": None, "reason": "缺少K线数据，无法评估风险回报结构"},
+        }
+
+    if isinstance(price_data, pd.DataFrame):
+        df = price_data.copy()
+    else:
+        df = price_data.get("full_data") if isinstance(price_data, dict) else None
+        if df is not None:
+            df = df.copy()
+
+    if df is None or len(df) < (lookback + recent_exclude + 5):
         return {
             "mode": "range",
             "long":  {"tag": "unknown", "ratio": None, "reason": "样本不足，无法稳定评估风险回报结构"},
             "short": {"tag": "unknown", "ratio": None, "reason": "样本不足，无法稳定评估风险回报结构"},
         }
 
-    df = price_data.copy()
     df = df.iloc[-(lookback + recent_exclude):]  # 保留需要的窗口
     recent = df.iloc[-recent_exclude:]
     base = df.iloc[:-recent_exclude]             # 用于定义“原始区间”
