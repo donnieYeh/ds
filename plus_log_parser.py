@@ -155,7 +155,7 @@ def parse_plus_log(log_text: str) -> List[Dict[str, Any]]:
                 data["price_change"] = s.split(":", 1)[-1].strip()
             elif s.startswith("DeepSeek原始回复:"):
                 # everything after the colon could include a JSON-like block
-                after = line.split(":", 1)[-1].lstrip()
+                after = s.split(":", 1)[-1].lstrip()
                 if after:
                     in_ds = True
                     ds_lines.append(after)
@@ -172,24 +172,26 @@ def parse_plus_log(log_text: str) -> List[Dict[str, Any]]:
                     ds_mode = None
                 # continue
             elif in_ds:
-                ds_lines.append(line)
+                plain_line = _strip_ts_prefix(line)
+                ds_lines.append(plain_line)
+                stripped_line = plain_line.strip()
                 if ds_mode == 'fenced':
                     # close on next fence line
-                    if line.strip().startswith("```") and ds_fence_opened:
+                    if stripped_line.startswith("```") and ds_fence_opened:
                         finish_ds()
                     else:
                         ds_fence_opened = True  # we passed the opening line
                 else:
                     # default to brace mode if not yet set
                     if ds_mode is None:
-                        if line.strip().startswith("```"):
+                        if stripped_line.startswith("```"):
                             ds_mode = 'fenced'
                             ds_fence_opened = True
                         else:
                             ds_mode = 'brace'
                             brace_depth = 0
                     if ds_mode == 'brace':
-                        brace_depth += line.count("{") - line.count("}")
+                        brace_depth += stripped_line.count("{") - stripped_line.count("}")
                         if brace_depth <= 0:
                             finish_ds()
             elif s.startswith("信号统计:"):
