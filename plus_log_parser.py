@@ -52,6 +52,39 @@ def _parse_position(text: str):
         return text.strip()
 
 
+def _parse_ds_json(ds_text: str):
+    """Attempt to parse DeepSeek JSON even if formatting is slightly invalid."""
+    if not ds_text:
+        return None
+    l = ds_text.find("{")
+    r = ds_text.rfind("}")
+    if l == -1 or r == -1 or r <= l:
+        return None
+    snippet = ds_text[l:r + 1].strip()
+    if not snippet:
+        return None
+
+    def _try_json(text: str):
+        try:
+            return json.loads(text)
+        except Exception:
+            return None
+
+    obj = _try_json(snippet)
+    if obj is not None:
+        return obj
+
+    try:
+        return ast.literal_eval(snippet)
+    except Exception:
+        pass
+
+    cleaned = snippet.replace("'", '"')
+    cleaned = re.sub(r'(\b\w+\b)\s*:', r'"\1":', cleaned)
+    cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)
+    return _try_json(cleaned)
+
+
 def split_records(log_text: str) -> List[str]:
     """Split the full log into per-run records.
 
@@ -229,31 +262,19 @@ def parse_plus_log(log_text: str) -> List[Dict[str, Any]]:
 
         if ds_raw:
             data["deepseek_raw"] = ds_raw
-            # Try to parse JSON inside fenced block or braces
-            try:
-                # Extract substring between first '{' and last '}'
-                l = ds_raw.find('{')
-                r = ds_raw.rfind('}')
-                if l != -1 and r != -1 and r > l:
-                    obj = json.loads(ds_raw[l:r+1])
-                    # Fill fields if missing
-                    data.setdefault("signal", obj.get("signal"))
-                    data.setdefault("confidence", obj.get("confidence"))
-                    data.setdefault("reason", obj.get("reason"))
-                    sl = obj.get("stop_loss")
-                    tp = obj.get("take_profit")
-                    if sl is not None:
-                        try:
-                            data.setdefault("stop_loss", float(sl))
-                        except Exception:
-                            pass
-                    if tp is not None:
-                        try:
-                            data.setdefault("take_profit", float(tp))
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+            obj = _parse_ds_json(ds_raw)
+            if obj:
+                data.setdefault("signal", obj.get("signal"))
+                data.setdefault("confidence", obj.get("confidence"))
+                data.setdefault("reason", obj.get("reason"))
+                for key, target in (("stop_loss", "stop_loss"), ("take_profit", "take_profit")):
+                    val = obj.get(key)
+                    if val is None:
+                        continue
+                    try:
+                        data.setdefault(target, float(val))
+                    except Exception:
+                        pass
 
         # Generate an id for record (prefer exec_time)
         rec_id = data.get("exec_time") or data.get("exec_time_iso") or str(len(items))
