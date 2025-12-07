@@ -10,6 +10,11 @@
     h1 { font-size: 18px; margin: 0 12px 0 0; }
     button { background: #334155; color: #e2e8f0; border: 1px solid #475569; border-radius: 6px; padding: 6px 10px; cursor: pointer; }
     button:hover { background: #475569; }
+    .filters { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 12px; font-size: 12px; color: #94a3b8; }
+    .filter-group { display: flex; align-items: center; gap: 8px; }
+    .filter-title { font-weight: 600; color: #cbd5f5; }
+    .filter-group label { display: flex; gap: 4px; align-items: center; cursor: pointer; }
+    .filter-group input { accent-color: #42a5f5; }
     .meta { color: #94a3b8; font-size: 12px; }
     .grid { display: grid; grid-template-columns: 1fr; gap: 10px; }
     .card { border: 1px solid #1e293b; border-radius: 8px; background: #0b1220; }
@@ -29,8 +34,16 @@
     .empty { color: #64748b; font-style: italic; padding: 24px; text-align: center; }
   </style>
   <script>
+    const ALL_SIGNALS = ["BUY", "SELL", "HOLD", "__NONE__"];
+    const ALL_CONFIDENCE = ["HIGH", "MEDIUM", "LOW", "__NONE__"];
+    const filters = {
+      signals: new Set(ALL_SIGNALS),
+      confidences: new Set(ALL_CONFIDENCE),
+    };
+    let cachedRecords = [];
+    let cachedMeta = {};
+
     async function fetchRecords() {
-      // Use relative path so it works under /ds
       const res = await fetch('api/records');
       return res.json();
     }
@@ -109,7 +122,43 @@
 
     async function load() {
       const data = await fetchRecords();
-      render(data.records, { log_path: data.log_path, last_error: data.last_error });
+      cachedRecords = data.records || [];
+      cachedMeta = { log_path: data.log_path, last_error: data.last_error };
+      renderCurrent();
+    }
+
+    function renderCurrent() {
+      const filtered = applyFilters(cachedRecords);
+      render(filtered, cachedMeta);
+    }
+
+    function applyFilters(records) {
+      return (records || []).filter(r => {
+        const sigKey = (r.signal || "__NONE__").toUpperCase();
+        const confKey = (r.confidence || "__NONE__").toUpperCase();
+        return filters.signals.has(sigKey) && filters.confidences.has(confKey);
+      });
+    }
+
+    function bindFilterControls() {
+      document.querySelectorAll("input[data-filter='signal']").forEach(input => {
+        input.addEventListener('change', () => updateFilterSet('signals'));
+      });
+      document.querySelectorAll("input[data-filter='confidence']").forEach(input => {
+        input.addEventListener('change', () => updateFilterSet('confidences'));
+      });
+    }
+
+    function updateFilterSet(type) {
+      const selector = type === 'signals' ? "input[data-filter='signal']" : "input[data-filter='confidence']";
+      const set = filters[type];
+      set.clear();
+      document.querySelectorAll(selector).forEach(input => {
+        if (input.checked) {
+          set.add(input.value);
+        }
+      });
+      renderCurrent();
     }
 
     function expandAll(open) {
@@ -123,6 +172,7 @@
       document.getElementById('btnExpand').addEventListener('click', () => expandAll(true));
       document.getElementById('btnCollapse').addEventListener('click', () => expandAll(false));
       document.getElementById('btnRefresh').addEventListener('click', load);
+      bindFilterControls();
     });
   </script>
 </head>
@@ -133,6 +183,22 @@
     <button id="btnExpand">展开全部</button>
     <button id="btnCollapse">折叠全部</button>
   </header>
+  <div class="filters">
+    <div class="filter-group">
+      <span class="filter-title">信号</span>
+      <label><input type="checkbox" data-filter="signal" value="BUY" checked>BUY</label>
+      <label><input type="checkbox" data-filter="signal" value="SELL" checked>SELL</label>
+      <label><input type="checkbox" data-filter="signal" value="HOLD" checked>HOLD</label>
+      <label><input type="checkbox" data-filter="signal" value="__NONE__" checked>未指定</label>
+    </div>
+    <div class="filter-group">
+      <span class="filter-title">信心</span>
+      <label><input type="checkbox" data-filter="confidence" value="HIGH" checked>HIGH</label>
+      <label><input type="checkbox" data-filter="confidence" value="MEDIUM" checked>MEDIUM</label>
+      <label><input type="checkbox" data-filter="confidence" value="LOW" checked>LOW</label>
+      <label><input type="checkbox" data-filter="confidence" value="__NONE__" checked>未指定</label>
+    </div>
+  </div>
   <div id="grid" class="grid"></div>
 </body>
 </html>

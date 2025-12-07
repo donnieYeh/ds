@@ -64,6 +64,7 @@ TRADE_CONFIG = {
     'leverage': 10,  # 杠杆倍数,只影响保证金不影响下单价值
     'timeframe': '15m',  # 使用15分钟K线
     'test_mode': False,  # 测试模式
+    'require_high_confidence_entry': _get_bool_env('REQUIRE_HIGH_CONFIDENCE_ENTRY', True),  # 是否仅允许高信心开单
     'data_points': 96,  # 24小时数据（96根15分钟K线）
     'recent_kline_count': _get_recent_kline_count_default(),  # 近N根K线用于提示/决策
     'print_prompt': _get_bool_env('PRINT_PROMPT', False),  # 是否打印提示词
@@ -113,6 +114,12 @@ def print_runtime_config():
             + f"; 基数USDT={pm.get('base_usdt_amount')}, 倍数(H/M/L)="
             + f"{pm.get('high_confidence_multiplier')}/{pm.get('medium_confidence_multiplier')}/{pm.get('low_confidence_multiplier')}, "
             + f"最大仓位比例={pm.get('max_position_ratio')}, 趋势倍数={pm.get('trend_strength_multiplier')}"
+        )
+        require_high = cfg.get('require_high_confidence_entry', True)
+        env_require_high = os.getenv('REQUIRE_HIGH_CONFIDENCE_ENTRY')
+        print(
+            f"- 高信心开单限制: {'启用' if require_high else '禁用'}"
+            + (f"  (来自环境变量 REQUIRE_HIGH_CONFIDENCE_ENTRY={env_require_high})" if env_require_high is not None else "")
         )
     except Exception as e:
         print(f"⚠️ 配置打印失败: {e}")
@@ -314,6 +321,948 @@ def calculate_intelligent_position_v2(signal_data, price_data, current_position)
         # fallback: fixed tiny contract
         return max(TRADE_CONFIG.get('min_amount', 0.01), 0.01)
 
+
+def generate_sma_analysis(source, short=5, mid=20, long=80, price_col="close"):
+    """
+    基于已计算好的 5 / 20 / 80 周期 SMA 生成面向 LLM 的趋势描述文本。
+
+    支持两种输入:
+        - price_data 字典：需包含 'full_data' (带有 sma_X 列) 与当前 price
+        - DataFrame：需包含 close 及相应的 sma_X 列
+    """
+    import numpy as np
+
+    price_now = None
+    df = None
+    tech = {}
+
+    if isinstance(source, dict):
+        price_data = source
+        df = price_data.get('full_data')
+        tech = price_data.get('technical_data', {})
+        price_now = price_data.get('price')
+    else:
+        df = source
+
+    if df is None or len(df) < long + 5:
+        return "📈 移动平均线分析：数据不足，暂无法给出可靠的均线趋势评估，仅供参考。"
+
+    sma_cols = {
+        'short': f'sma_{short}',
+        'mid': f'sma_{mid}',
+        'long': f'sma_{long}'
+    }
+
+    for col in sma_cols.values():
+        if col not in df.columns:
+            return f"📈 移动平均线分析：缺少 {col} 数据，暂无法评估均线结构。"
+
+    sma_s = df[sma_cols['short']].astype(float)
+    sma_m = df[sma_cols['mid']].astype(float)
+    sma_l = df[sma_cols['long']].astype(float)
+
+    price_series = df[price_col].astype(float) if price_col in df.columns else None
+    if price_now is None and price_series is not None:
+        price_now = float(price_series.iloc[-1])
+    elif price_now is None:
+        return "📈 移动平均线分析：缺少价格数据，无法完成评估。"
+
+    sma_s_now = float(tech.get(sma_cols['short'], sma_s.iloc[-1])) if tech else float(sma_s.iloc[-1])
+    sma_m_now = float(tech.get(sma_cols['mid'], sma_m.iloc[-1])) if tech else float(sma_m.iloc[-1])
+    sma_l_now = float(tech.get(sma_cols['long'], sma_l.iloc[-1])) if tech else float(sma_l.iloc[-1])
+    price_now = float(price_now)
+
+    # 如有 NaN，直接降级提示
+    if any(np.isnan([sma_s_now, sma_m_now, sma_l_now])):
+        return "📈 移动平均线分析：当前均线数据尚未完全形成，暂不作为主要决策依据。"
+
+    # 均线结构判定
+    if sma_s_now > sma_m_now > sma_l_now:
+        structure = "5 > 20 > 80，形成多头排列，趋势偏多。"
+    elif sma_s_now < sma_m_now < sma_l_now:
+        structure = "5 < 20 < 80，形成空头排列，趋势偏空。"
+    else:
+        structure = "均线互相纠缠或缺乏明确排列结构，偏震荡或趋势不明。"
+
+    # 价格相对位置
+    max_sma = max(sma_s_now, sma_m_now, sma_l_now)
+    min_sma = min(sma_s_now, sma_m_now, sma_l_now)
+
+    if price_now > max_sma:
+        pos_desc = "当前价格位于所有均线上方，属相对强势区域，偏多头环境。"
+    elif price_now < min_sma:
+        pos_desc = "当前价格位于所有均线下方，属相对弱势区域，偏空头环境。"
+    else:
+        # 介于某些均线之间，给一点层次感
+        if price_now >= sma_m_now:
+            pos_desc = "当前价格介于中长期均线附近，短期虽有支撑，但上方仍需观察动能延续。"
+        elif price_now <= sma_m_now:
+            pos_desc = "当前价格介于短中均线之间，存在震荡或方向选择阶段。"
+        else:
+            pos_desc = "当前价格位于均线密集区附近，市场处于震荡平衡状态。"
+
+    # 趋势稳定性：看均线斜率是否同向
+    def slope(series, window=3):
+        if len(series.dropna()) < window + 1:
+            return 0.0
+        return float(series.iloc[-1] - series.iloc[-1 - window])
+
+    slope_s = slope(sma_s)
+    slope_m = slope(sma_m)
+    slope_l = slope(sma_l)
+
+    same_direction = (slope_s >= 0 and slope_m >= 0 and slope_l >= 0) or \
+                     (slope_s <= 0 and slope_m <= 0 and slope_l <= 0)
+
+    if same_direction and abs(slope_l) > 0:
+        stability = "短中长周期均线大致同向，趋势具有一定延续性，可作为本周期的重要参考基线。"
+    elif abs(slope_s) > 0 and abs(slope_m) < 1e-9 and abs(slope_l) < 1e-9:
+        stability = "仅短周期均线出现明显拐动，中长期仍趋平，可能是局部波动或假突破，可在结论中说明短线证据的局限。"
+    else:
+        stability = "均线方向不一致，说明多空力量正在博弈，趋势稳定性一般，可结合其他指标与风险控制做进一步说明。"
+
+    text = (
+        "📈 移动平均线分析（趋势基线）：\n"
+        f"- 使用 {short} / {mid} / {long} 周期简单移动平均线（SMA）衡量短期、中期与长周期趋势。\n"
+        f"- 当前均线结构：{structure}\n"
+        f"- 价格位置评估：{pos_desc}\n"
+        f"- 趋势稳定性判断：{stability}\n"
+    )
+
+    return text
+
+def generate_momentum_analysis(price_data):
+    """
+    从 price_data['technical_data'] 中提取 RSI、MACD、信号线，生成面向 LLM 的动量指标分析文本。
+    不进行指标计算，仅做语义解释。
+
+    参数:
+        price_data: dict
+            包含 'technical_data' 字段的行情数据（参见 get_btc_ohlcv_enhanced 返回结构）
+    """
+    if not price_data or "technical_data" not in price_data:
+        return "📊 动量指标分析：缺少技术指标数据，无法进行动量判断。"
+
+    tech = price_data.get("technical_data", {})
+    rsi = tech.get("rsi")
+    macd = tech.get("macd")
+    signal = tech.get("macd_signal")
+    hist = tech.get("macd_histogram")
+
+    # --- 数据可用性检查 ---
+    if rsi is None or macd is None or signal is None:
+        return "📊 动量指标分析：RSI 或 MACD 数据缺失，暂无法提供有效动量信号。"
+
+    # --- RSI 分析 ---
+    if rsi >= 80:
+        rsi_desc = "RSI 处于极端超买区，短期上涨透支，存在回调风险。"
+    elif rsi >= 70:
+        rsi_desc = "RSI 处于超买区，多头动能强，可观察上行动能是否延续。"
+    elif 60 <= rsi < 70:
+        rsi_desc = "RSI 位于中性偏强区，多头略占优势。"
+    elif 40 <= rsi < 60:
+        rsi_desc = "RSI 接近中性，多空力量均衡，市场可能处于震荡阶段。"
+    elif 30 <= rsi < 40:
+        rsi_desc = "RSI 位于中性偏弱区，空头略占上风。"
+    elif 20 <= rsi < 30:
+        rsi_desc = "RSI 进入超卖区，存在技术性反弹可能。"
+    else:
+        rsi_desc = "RSI 处于极端超卖区，短期下跌过度，可能出现强势反弹。"
+
+    # --- MACD 分析 ---
+    if macd > signal:
+        macd_state = "MACD 主线高于信号线，多头动能占优。"
+        if hist and hist > 0:
+            macd_desc = "多头柱体持续放大，动能延续良好。"
+        elif hist and hist < 0:
+            macd_desc = "虽然主线高于信号线，但柱体转负，显示上行动能减弱。"
+        else:
+            macd_desc = "动能维持正向但无明显放大。"
+    elif macd < signal:
+        macd_state = "MACD 主线低于信号线，空头动能占优。"
+        if hist and hist < 0:
+            macd_desc = "空头柱体放大，趋势压力明显。"
+        elif hist and hist > 0:
+            macd_desc = "尽管主线低于信号线，但柱体转正，空头动能出现减弱迹象。"
+        else:
+            macd_desc = "动能偏空但趋于平缓。"
+    else:
+        macd_state = "MACD 与信号线几乎重合，动能方向暂不明朗。"
+        macd_desc = "市场处于动能转换或整理阶段。"
+
+    # --- 综合结论（LLM友好标签） ---
+    if rsi >= 60 and macd > signal:
+        overall = "整体动能评估：多头动能占优，市场偏强，可关注延续性。"
+    elif rsi <= 40 and macd < signal:
+        overall = "整体动能评估：空头动能占优，短期承压，可重点描述压力量级。"
+    elif 45 <= rsi <= 55:
+        overall = "整体动能评估：动能中性，方向不明，适合等待突破信号。"
+    else:
+        overall = "整体动能评估：多空信号交织，市场处于转换期，宜结合趋势结构观察。"
+
+    text = (
+        "📊 动量指标分析：\n"
+        f"- RSI：{rsi:.2f}。{rsi_desc}\n"
+        f"- MACD 主线：{macd:.4f}，信号线：{signal:.4f}。{macd_state}{macd_desc}\n"
+        f"- {overall}\n"
+        "- 提示：动量信号仅作为辅助依据，应结合均线结构、价格形态与风险控制共同评估。\n"
+    )
+
+    return text
+
+def generate_bollinger_analysis(price_data, lookback: int = 40):
+    """
+    基于 price_data 中已计算好的布林带数据，生成给 LLM 用的布林带语义分析。
+
+    依赖:
+        price_data['technical_data']:
+            - bb_upper, bb_lower, bb_position
+        price_data['full_data'] (可选，用于带宽压缩/扩张判断):
+            - bb_upper, bb_lower, bb_middle
+
+    不重新计算技术指标，只做解释与归纳。
+    """
+
+    if not price_data or "technical_data" not in price_data:
+        return "🎚️ 布林带分析：缺少布林带相关数据，暂无法评估波动区间与相对位置。"
+
+    tech = price_data["technical_data"]
+    bb_pos = tech.get("bb_position")
+    bb_upper = tech.get("bb_upper")
+    bb_lower = tech.get("bb_lower")
+    rsi = tech.get("rsi")
+
+    # 基础可用性检查
+    if bb_pos is None or bb_upper is None or bb_lower is None:
+        return "🎚️ 布林带分析：布林带数据不完整，暂不将其作为本周期的主要决策依据。"
+
+    try:
+        bb_pos = float(bb_pos)
+        bb_upper = float(bb_upper)
+        bb_lower = float(bb_lower)
+    except (TypeError, ValueError):
+        return "🎚️ 布林带分析：布林带数据异常，无法给出可靠评估。"
+
+    parts = ["🎚️ 布林带分析："]
+
+    # === 1️⃣ 相对位置解读（使用已给出的 bb_position） ===
+    # bb_position = (price - lower) / (upper - lower)
+    if bb_pos <= 0.1:
+        pos_desc = "价格贴近下轨，处于相对偏弱/可能超卖区域。"
+        zone = "下轨附近"
+    elif bb_pos <= 0.3:
+        pos_desc = "价格位于布林带下半区，偏弱整理或下行趋势中。"
+        zone = "下半区"
+    elif bb_pos < 0.7:
+        pos_desc = "价格接近中轨附近，属于相对均衡/震荡区域。"
+        zone = "中部区域"
+    elif bb_pos < 0.9:
+        pos_desc = "价格位于布林带上半区，表现为偏强运行，多头占优。"
+        zone = "上半区"
+    else:
+        pos_desc = "价格贴近上轨，短期多头情绪较强，可能存在阶段性过热风险。"
+        zone = "上轨附近"
+
+    parts.append(f"- 当前位置：约处于区间的 {bb_pos * 100:.2f}%，即{zone}。{pos_desc}")
+
+    # === 2️⃣ 带宽与波动强度（利用 full_data，不做新指标，只对现有列做差） ===
+    width_desc = "带宽数据不足，暂不评估波动压缩或扩张。"
+    df = price_data.get("full_data")
+
+    try:
+        if df is not None and all(col in df.columns for col in ["bb_upper", "bb_lower", "bb_middle"]):
+            recent = df.tail(max(lookback, 20)).copy()
+            # 避免除零，仅在中轨有效时计算
+            recent["bb_width_ratio"] = (recent["bb_upper"] - recent["bb_lower"]) / recent["bb_middle"].replace(0, float("nan"))
+            current_row = recent.iloc[-1]
+            current_width = float(current_row["bb_width_ratio"]) if pd.notna(current_row["bb_width_ratio"]) else None
+            avg_width = float(recent["bb_width_ratio"].dropna().mean()) if not recent["bb_width_ratio"].dropna().empty else None
+
+            if current_width is not None and avg_width is not None:
+                if current_width < avg_width * 0.7:
+                    width_desc = "当前布林带明显收窄，波动被压缩，后续存在放量突破或单边行情的潜在风险。"
+                elif current_width > avg_width * 1.3:
+                    width_desc = "当前布林带显著张口，波动放大，多为空头或多头趋势演绎阶段，应重视顺势交易。"
+                else:
+                    width_desc = "当前布林带带宽接近近期均值，波动水平正常，无明显压缩或极端放大信号。"
+
+    except Exception:
+        # 容错，保持默认描述
+        pass
+
+    parts.append(f"- 波动带宽评估：{width_desc}")
+
+    # === 3️⃣ 与 RSI 的联合信号（只读已有 RSI，不计算） ===
+    overall = None
+    try:
+        if rsi is not None:
+            rsi = float(rsi)
+            if bb_pos >= 0.9 and rsi >= 70:
+                overall = "综合判断：价格贴近上轨且 RSI 超买，短期存在回调或整理压力，追高需控制仓位与杠杆。"
+            elif bb_pos <= 0.1 and rsi <= 30:
+                overall = "综合判断：价格贴近下轨且 RSI 超卖，存在技术性反弹或短线修复机会，但需结合趋势确认。"
+            elif 0.3 < bb_pos < 0.7 and 40 <= rsi <= 60:
+                overall = "综合判断：价格与 RSI 均处于中性区间，更偏向震荡市特征，适合等待突破信号。"
+
+    except (TypeError, ValueError):
+        pass
+
+    if not overall:
+        overall = "综合判断：布林带当前更多提供价格相对位置与波动信息，应与趋势结构（均线）、MACD、RSI 等联合使用，不单独作为开仓或反手依据。"
+
+    parts.append(f"- {overall}")
+
+    # 风控导向，避免 LLM 把“上轨/下轨”当成机械反转信号
+    parts.append("- 提示：价格触及或接近布林带上下轨，并不自动等于反转信号，更重要的是结合成交量、趋势方向和其他指标确认。")
+
+    return "\n".join(parts)
+
+def generate_price_action_tags(price_data) -> list[str]:
+    """
+    基于本地K线数据生成形态/结构标签。
+    仅输出中性标签，不做方向结论（假突破/冲顶等交给大模型判断）。
+    参数 price_data 可传入 DataFrame 或包含 'full_data' 的行情字典。
+    """
+    if price_data is None:
+        return []
+
+    if isinstance(price_data, pd.DataFrame):
+        df = price_data.copy()
+    else:
+        df = price_data.get("full_data") if isinstance(price_data, dict) else None
+        if df is not None:
+            df = df.copy()
+
+    if df is None or len(df) < 20:
+        return []
+
+    df = df.sort_index()
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    tags = set()
+    tags.update(_single_candle_tags(df, last, prev))
+    tags.update(_sequence_tags(df))
+    tags.update(_range_break_tags(df))
+    tags.update(_volatility_tags(df))
+
+    return sorted(tags)
+
+def _single_candle_tags(df: pd.DataFrame, last, prev) -> list[str]:
+    tags = []
+
+    o, h, l, c = float(last['open']), float(last['high']), float(last['low']), float(last['close'])
+    body = abs(c - o)
+    full_range = max(h - l, 1e-9)
+    upper = h - max(o, c)
+    lower = min(o, c) - l
+
+    body_ma_window = min(20, len(df))
+    body_ma = (df['close'].iloc[-body_ma_window:] - df['open'].iloc[-body_ma_window:]).abs().mean()
+
+    # 长上下影 & Doji & 大实体
+    if upper >= max(2 * body, 0.4 * full_range) and body / full_range <= 0.6:
+        tags.append("LONG_UPPER_SHADOW")
+    if lower >= max(2 * body, 0.4 * full_range) and body / full_range <= 0.6:
+        tags.append("LONG_LOWER_SHADOW")
+    if body_ma > 0 and body >= 1.5 * body_ma:
+        tags.append("BIG_BODY")
+    if body <= 0.2 * full_range and full_range >= 0.5 * body_ma:
+        tags.append("SMALL_BODY_DOJI")
+
+    # 吞没候选（仅做线索）
+    po, ph, pl, pc = float(prev['open']), float(prev['high']), float(prev['low']), float(prev['close'])
+    prev_body = abs(pc - po)
+
+    # 看多吞没候选
+    if c > o and pc < po and body > prev_body and l <= pl and c >= ph:
+        tags.append("BULLISH_ENGULFING_CANDIDATE")
+
+    # 看空吞没候选
+    if c < o and pc > po and body > prev_body and h >= ph and c <= pl:
+        tags.append("BEARISH_ENGULFING_CANDIDATE")
+
+    return tags
+def _sequence_tags(df: pd.DataFrame) -> list[str]:
+    tags = []
+    closes = df['close']
+    highs = df['high']
+    lows = df['low']
+
+    # 连续涨跌（取最近5根内的极值）
+    max_lookback = min(5, len(df) - 1)
+    up_streak = 0
+    down_streak = 0
+    for i in range(1, max_lookback + 1):
+        if closes.iloc[-i] > closes.iloc[-i-1]:
+            up_streak += 1
+            if down_streak > 0:
+                break
+        elif closes.iloc[-i] < closes.iloc[-i-1]:
+            down_streak += 1
+            if up_streak > 0:
+                break
+        else:
+            break
+
+    if up_streak >= 3:
+        tags.append(f"N_CONSECUTIVE_UP_{up_streak}")
+    if down_streak >= 3:
+        tags.append(f"N_CONSECUTIVE_DOWN_{down_streak}")
+
+    # 高点/低点序列（简单3段结构）
+    if len(df) >= 4:
+        recent_highs = highs.iloc[-4:]
+        recent_lows = lows.iloc[-4:]
+
+        if all(recent_highs.iloc[i] < recent_highs.iloc[i+1] for i in range(3)):
+            tags.append("HIGHER_HIGH_SERIES_3")
+        if all(recent_lows.iloc[i] > recent_lows.iloc[i+1] for i in range(3)):
+            tags.append("LOWER_LOW_SERIES_3")
+
+    # 动能加速：最近5根实体对比前20根
+    if len(df) >= 25:
+        recent_body = (df['close'].iloc[-5:] - df['open'].iloc[-5:]).abs().mean()
+        hist_body = (df['close'].iloc[-25:-5] - df['open'].iloc[-25:-5]).abs().mean()
+        if hist_body > 0:
+            ratio = recent_body / hist_body
+            if ratio >= 1.6:
+                # 方向中性，交给模型从趋势+价格判断多空
+                tags.append("MOMENTUM_ACCELERATION_STRONG")
+            elif ratio >= 1.3:
+                tags.append("MOMENTUM_ACCELERATION_MILD")
+
+    return tags
+def _range_break_tags(df: pd.DataFrame) -> list[str]:
+    tags = []
+    closes = df['close']
+    highs = df['high']
+    lows = df['low']
+
+    last_close = float(closes.iloc[-1])
+    last_high = float(highs.iloc[-1])
+    last_low = float(lows.iloc[-1])
+
+    # 短&中区间
+    short_n = min(48, len(df))
+    mid_n = min(144, len(df))
+
+    short_high = float(highs.iloc[-short_n:].max())
+    short_low = float(lows.iloc[-short_n:].min())
+    mid_high = float(highs.iloc[-mid_n:].max())
+    mid_low = float(lows.iloc[-mid_n:].min())
+
+    # 相对距离（永续合约，这里用百分比）
+    def rel(x, y):
+        return abs(x - y) / max(y, 1e-9)
+
+    # 贴近区间边缘
+    if rel(last_close, short_high) <= 0.003:
+        tags.append("NEAR_SHORT_RANGE_HIGH")
+    if rel(last_close, short_low) <= 0.003:
+        tags.append("NEAR_SHORT_RANGE_LOW")
+
+    # 短区间突破
+    if last_close > short_high * 1.001:
+        tags.append("BREAK_ABOVE_SHORT_RANGE_HIGH")
+    if last_close < short_low * 0.999:
+        tags.append("BREAK_BELOW_SHORT_RANGE_LOW")
+
+    # 假突破嫌疑特征（仍是“嫌疑”，不是结论）
+    # 上破后长上影/收回区间附近
+    if "BREAK_ABOVE_SHORT_RANGE_HIGH" in tags:
+        upper_shadow = last_high - max(float(df['open'].iloc[-1]), last_close)
+        body = abs(last_close - float(df['open'].iloc[-1]))
+        full_range = max(last_high - last_low, 1e-9)
+
+        if upper_shadow >= max(2 * body, 0.4 * full_range) or last_close <= short_high * 1.0015:
+            tags.append("BREAKUP_WEAK_FOLLOWTHROUGH_HINT")
+
+    if "BREAK_BELOW_SHORT_RANGE_LOW" in tags:
+        lower_shadow = min(float(df['open'].iloc[-1]), last_close) - last_low
+        body = abs(last_close - float(df['open'].iloc[-1]))
+        full_range = max(last_high - last_low, 1e-9)
+
+        if lower_shadow >= max(2 * body, 0.4 * full_range) or last_close >= short_low * 0.9985:
+            tags.append("BREAKDOWN_WEAK_FOLLOWTHROUGH_HINT")
+
+    return tags
+def _volatility_tags(df: pd.DataFrame) -> list[str]:
+    tags = []
+    if len(df) < 40:
+        return tags
+
+    hl = df['high'] - df['low']
+
+    recent_n = 20
+    base_n = 60
+
+    recent_vol = hl.iloc[-recent_n:].mean()
+    base_vol = hl.iloc[-base_n:-recent_n].mean() if len(df) >= base_n + recent_n else hl.iloc[:-recent_n].mean()
+
+    if base_vol <= 0:
+        return tags
+
+    ratio = recent_vol / base_vol
+
+    if ratio <= 0.6:
+        tags.append("VOLATILITY_SQUEEZE")
+    elif ratio >= 1.6:
+        tags.append("VOLATILITY_EXPANSION")
+
+    return tags
+def format_price_action_tags_for_llm(tags: list[str]) -> str:
+    """
+    将本地形态/结构标签转换为 LLM 友好的简要文字描述。
+    要求：
+    - 简短
+    - 中性
+    - 不下交易结论，只描述结构线索
+    """
+    if not tags:
+        return "未检测到特别突出的K线形态或价格结构信号，本地特征提取保持中性。"
+
+    desc_map = {
+        # 单根K线
+        "LONG_UPPER_SHADOW": "当前K线出现相对明显的长上影，上方抛压或获利了结迹象增加。",
+        "LONG_LOWER_SHADOW": "当前K线出现相对明显的长下影，下方承接或买盘支撑迹象增加。",
+        "BIG_BODY": "当前K线实体显著大于近期平均，短线方向性波动放大。",
+        "SMALL_BODY_DOJI": "当前K线实体较小，短线方向犹豫，等待进一步选择。",
+        "BULLISH_ENGULFING_CANDIDATE": "出现潜在多头吞没形态候选，短线多头尝试主导节奏。",
+        "BEARISH_ENGULFING_CANDIDATE": "出现潜在空头吞没形态候选，短线空头尝试主导节奏。",
+
+        # 连续结构 / 动能
+        "MOMENTUM_ACCELERATION_STRONG": "近期K线实体整体明显放大，相比过去存在较强动能加速迹象。",
+        "MOMENTUM_ACCELERATION_MILD": "近期K线实体略有放大，存在一定动能增强迹象。",
+
+        # 区间/突破
+        "NEAR_SHORT_RANGE_HIGH": "当前价格逼近近期短周期震荡区间上沿位置。",
+        "NEAR_SHORT_RANGE_LOW": "当前价格逼近近期短周期震荡区间下沿位置。",
+        "BREAK_ABOVE_SHORT_RANGE_HIGH": "价格向上突破近期短周期区间上沿，有上攻延伸的尝试。",
+        "BREAK_BELOW_SHORT_RANGE_LOW": "价格向下跌破近期短周期区间下沿，有下探延伸的尝试。",
+        "BREAKUP_WEAK_FOLLOWTHROUGH_HINT": "上破后跟随力度相对有限，存在动能衰减或假突破的结构疑虑。",
+        "BREAKDOWN_WEAK_FOLLOWTHROUGH_HINT": "下破后跟随力度相对有限，存在动能衰减或假跌破的结构疑虑。",
+
+        # 波动结构
+        "VOLATILITY_SQUEEZE": "近期波动率明显收缩，市场处于压缩整理阶段，潜在蓄势状态。",
+        "VOLATILITY_EXPANSION": "近期波动率明显放大，市场处于活跃波动阶段，方向博弈加剧。",
+    }
+
+    # 支持 N_CONSECUTIVE_UP_x / DOWN_x 动态文案
+    pretty_lines = []
+
+    for t in tags:
+        if t.startswith("N_CONSECUTIVE_UP_"):
+            n = t.split("_")[-1]
+            pretty_lines.append(f"近期出现连续 {n} 根收盘抬升的上涨序列，多头短线保持主动。")
+        elif t.startswith("N_CONSECUTIVE_DOWN_"):
+            n = t.split("_")[-1]
+            pretty_lines.append(f"近期出现连续 {n} 根收盘走低的下跌序列，空头短线保持主动。")
+        elif t in desc_map:
+            pretty_lines.append(desc_map[t])
+        # 未映射的标签静默忽略或保留原名（建议忽略，避免噪音）
+
+    if not pretty_lines:
+        return "存在部分结构标签触发，但整体信号不具备单独解释意义，请综合其他因子评估。"
+
+    return "\n".join(f"- {line}" for line in pretty_lines)
+
+
+def evaluate_overheat(price_data):
+    """
+    基于已有技术数据，给出一个“动能是否可能透支”的评估结果。
+    仅作为特征输入给大模型，不是硬风控规则。
+
+    返回:
+        {
+            "level": "none" | "mild" | "strong",
+            "factors": [str, ...]  # 描述原因，供拼接进 prompt
+        }
+    """
+    tech = price_data.get("technical_data", {}) or {}
+    rsi = tech.get("rsi")
+    bb_pos = tech.get("bb_position")
+    macd_hist = tech.get("macd_histogram")
+    sma_5 = tech.get("sma_5")
+    sma_20 = tech.get("sma_20")
+
+    factors = []
+
+    try:
+        if rsi is not None:
+            rsi = float(rsi)
+        if bb_pos is not None:
+            bb_pos = float(bb_pos)
+        if macd_hist is not None:
+            macd_hist = float(macd_hist)
+        if sma_5 is not None and sma_20 is not None:
+            sma_5 = float(sma_5)
+            sma_20 = float(sma_20)
+    except (TypeError, ValueError):
+        return {"level": "none", "factors": ["技术数据异常，未进行透支评估"]}
+
+    # 1) 价格相对布林带的位置
+    if bb_pos is not None:
+        if bb_pos >= 1.05:
+            factors.append("价格明显高于布林上轨")
+        elif bb_pos >= 0.95:
+            factors.append("价格接近布林带上沿")
+
+    # 2) RSI 高位区
+    if rsi is not None:
+        if rsi >= 80:
+            factors.append("RSI 处于极高水平")
+        elif rsi >= 70:
+            factors.append("RSI 处于高位区间")
+
+    # 3) 均线加速或乖离（简单看 5 与 20 的差）
+    if sma_5 and sma_20:
+        diff_ratio = (sma_5 - sma_20) / sma_20 if sma_20 != 0 else 0
+        if diff_ratio > 0.03:
+            factors.append("短期价格/均线相对中期均线乖离偏大")
+
+    # 4) MACD 柱体衰减（需要 full_data，看最近几根）
+    df = price_data.get("full_data")
+    if df is not None and "macd_histogram" in df.columns:
+        recent = df["macd_histogram"].tail(4).tolist()
+        if len([x for x in recent if x is not None]) >= 3:
+            # 简单判断：从正高值开始走低，或在高位缩短
+            cleaned = [float(x) for x in recent if x is not None]
+            if len(cleaned) >= 3 and cleaned[-1] < cleaned[-2] > cleaned[-3] and cleaned[-2] > 0:
+                factors.append("MACD 动能在高位出现减弱迹象")
+
+    # 归纳 level（温和，不当成铁律，只是语义标签）
+    strong_signals = [
+        "价格明显高于布林上轨",
+        "RSI 处于极高水平",
+        "MACD 动能在高位出现减弱迹象",
+        "短期价格/均线相对中期均线乖离偏大",
+    ]
+
+    if not factors:
+        level = "none"
+    else:
+        score = sum(1 for f in factors if f in strong_signals)
+        if score >= 3:
+            level = "strong"
+        elif score >= 1:
+            level = "mild"
+        else:
+            level = "none"
+
+    return {"level": level, "factors": factors}
+
+def evaluate_price_volume_pattern(price_data, lookback: int = 20):
+    """
+    基于最近K线的价格与成交量关系，评估当前是否更像：
+    - 有支撑的有效突破（clean_breakout）
+    - 可能的假突破/冲高回落（possible_fake_breakout）
+    - 动能不足的弱突破（weak_breakout）
+    - 普通震荡/无明显信号（normal）
+
+    仅用于给大模型提供结构化线索，不直接做交易决策。
+    """
+    df = price_data.get("full_data")
+    if df is None:
+        return {"label": "normal", "reasons": ["缺少完整K线数据，未评估量价形态"]}
+
+    required_cols = {"open", "high", "low", "close", "volume"}
+    if not required_cols.issubset(df.columns):
+        return {"label": "normal", "reasons": ["K线数据缺少必要字段，未评估量价形态"]}
+
+    if len(df) < lookback + 3:
+        return {"label": "normal", "reasons": ["历史样本不足，量价评估不具稳定性"]}
+
+    recent = df.tail(lookback + 2).copy()
+    last = recent.iloc[-1]
+    prev = recent.iloc[-2]
+    hist = recent.iloc[:-1]
+
+    try:
+        o, h, l, c, v = map(float, (last["open"], last["high"], last["low"], last["close"], last["volume"]))
+        prev_high_max = float(hist["high"].max())
+        avg_vol = float(hist["volume"].mean())
+    except Exception:
+        return {"label": "normal", "reasons": ["量价数据异常，未评估量价形态"]}
+
+    if avg_vol <= 0:
+        return {"label": "normal", "reasons": ["平均成交量异常，未评估量价形态"]}
+
+    # 基本形态特征
+    rng = max(h - l, 1e-9)
+    body = abs(c - o)
+    upper_shadow = h - max(c, o)
+    lower_shadow = min(c, o) - l
+    vol_ratio = v / avg_vol
+
+    # 是否创新高（略加缓冲避免噪点）
+    is_new_high = h > prev_high_max * 1.001
+
+    reasons = []
+
+    # 情况 1：有效突破（新高 + 强收盘 + 放量）
+    if is_new_high and c > (l + 0.75 * rng) and vol_ratio >= 1.2:
+        reasons.append("价格突破近期高点且收盘接近高位，成交量高于均值，突破相对有支撑。")
+        return {"label": "clean_breakout", "reasons": reasons}
+
+    # 情况 2：可能假突破（新高但收回、长上影、高位放量）
+    if is_new_high:
+        # 长上影 + 放量
+        if upper_shadow > max(body * 2, rng * 0.4) and vol_ratio >= 1.0:
+            reasons.append("出现高位长上影放量冲高回落，存在假突破或短线资金出货可能。")
+            return {"label": "possible_fake_breakout", "reasons": reasons}
+
+        # 新高但缩量
+        if vol_ratio < 0.8:
+            reasons.append("价格略创新高但成交量不足，突破动能偏弱。")
+            return {"label": "weak_breakout", "reasons": reasons}
+
+    # 情况 3：无明显突破，但有信息
+    if vol_ratio >= 1.5 and body < rng * 0.3 and upper_shadow > body and c < (l + 0.5 * rng):
+        reasons.append("放量但收盘偏弱，存在上方压力或分歧。")
+        return {"label": "possible_fake_breakout", "reasons": reasons}
+
+    if vol_ratio <= 0.7 and body < rng * 0.3:
+        reasons.append("缩量小实体K线，市场观望情绪较重。")
+
+    if not reasons:
+        reasons.append("量价关系未出现明显异常或突破信号，视为常规波动。")
+
+    return {"label": "normal", "reasons": reasons}
+
+def compute_risk_reward_for_sides(price_data,
+                                  lookback: int = 80,
+                                  recent_exclude: int = 8,
+                                  breakout_eps: float = 0.001) -> dict:
+    """
+    基于最近一段结构，分别评估做多与做空方向的区间型风险回报。
+    显式区分：
+    - 区间内交易（range mode）
+    - 向上/向下突破后的交易（breakout mode）
+
+    返回:
+    {
+        "mode": "range" | "up_breakout" | "down_breakout",
+        "long":  {...},
+        "short": {...},
+    }
+    参数 price_data 可直接传入包含 OHLCV 列的 DataFrame，或是包含 'full_data' 键的行情字典。
+    """
+
+    if price_data is None:
+        return {
+            "mode": "range",
+            "long":  {"tag": "unknown", "ratio": None, "reason": "缺少K线数据，无法评估风险回报结构"},
+            "short": {"tag": "unknown", "ratio": None, "reason": "缺少K线数据，无法评估风险回报结构"},
+        }
+
+    if isinstance(price_data, pd.DataFrame):
+        df = price_data.copy()
+    else:
+        df = price_data.get("full_data") if isinstance(price_data, dict) else None
+        if df is not None:
+            df = df.copy()
+
+    if df is None or len(df) < (lookback + recent_exclude + 5):
+        return {
+            "mode": "range",
+            "long":  {"tag": "unknown", "ratio": None, "reason": "样本不足，无法稳定评估风险回报结构"},
+            "short": {"tag": "unknown", "ratio": None, "reason": "样本不足，无法稳定评估风险回报结构"},
+        }
+
+    df = df.iloc[-(lookback + recent_exclude):]  # 保留需要的窗口
+    recent = df.iloc[-recent_exclude:]
+    base = df.iloc[:-recent_exclude]             # 用于定义“原始区间”
+
+    prev_high = float(base["high"].max())
+    prev_low = float(base["low"].min())
+    current = float(recent["close"].iloc[-1])
+
+    base_range = max(prev_high - prev_low, 1e-8)
+
+    # --- 检测突破状态 ---
+    up_break = current > prev_high * (1 + breakout_eps)
+    down_break = current < prev_low * (1 - breakout_eps)
+
+    def _tag(r: float) -> str:
+        if r >= 2.0:
+            return "favorable"
+        elif r >= 1.0:
+            return "neutral"
+        elif r > 0:
+            return "unfavorable"
+        else:
+            return "unknown"
+
+    # === 情况1：向上突破（up_breakout mode） ===
+    if up_break:
+        # 假设：上破有效，多头止损放在 prev_high 下方，目标以“原区间高度的测幅”估计
+        breakout_level = prev_high
+        projected_target = breakout_level + base_range  # 机械测幅，非预测，只给结构参考
+
+        risk_long = max(current - breakout_level, 1e-8)
+        reward_long = max(projected_target - current, 0.0)
+        ratio_long = reward_long / risk_long if reward_long > 0 else 0.0
+
+        # 逆势做空：视为结构上不利或高度不确定
+        # 不给它“看起来很香”的R:R，避免误导
+        risk_short = max(projected_target - current, 1e-8)
+        reward_short = max(current - breakout_level, 0.0)
+        ratio_short = reward_short / risk_short if reward_short > 0 else 0.0
+
+        return {
+            "mode": "up_breakout",
+            "long": {
+                "tag": _tag(ratio_long),
+                "ratio": round(ratio_long, 2),
+                "reason": (
+                    f"价格已明显上破前高区间（{prev_low:.1f}~{prev_high:.1f}），"
+                    f"多头参考以前高作为止损附近位置，以原区间高度做测幅，"
+                    f"当前上破后的结构性R:R约为 {ratio_long:.2f}。"
+                ),
+            },
+            "short": {
+                # 这里直接把大部分情况压成不利/未知
+                "tag": "unfavorable" if ratio_short < 1.0 else "neutral",
+                "ratio": round(ratio_short, 2),
+                "reason": (
+                    "当前处于上破区间后的高位，逆势做空属于反趋势博弈，"
+                    "即使短线R:R看似可观，结构性优势仍未确认，仅在多因子强烈反转信号下才具备讨论价值。"
+                ),
+            },
+        }
+
+    # === 情况2：向下突破（down_breakout mode） ===
+    if down_break:
+        breakout_level = prev_low
+        projected_target = breakout_level - base_range
+
+        risk_short = max(breakout_level - current, 1e-8)
+        reward_short = max(current - projected_target, 0.0)
+        ratio_short = reward_short / risk_short if reward_short > 0 else 0.0
+
+        risk_long = max(current - projected_target, 1e-8)
+        reward_long = max(breakout_level - current, 0.0)
+        ratio_long = reward_long / risk_long if reward_long > 0 else 0.0
+
+        return {
+            "mode": "down_breakout",
+            "long": {
+                "tag": "unfavorable" if ratio_long < 1.0 else "neutral",
+                "ratio": round(ratio_long, 2),
+                "reason": (
+                    "当前处于下破区间后的低位，逆势做多属于反趋势博弈，"
+                    "结构上暂不具备稳定优势，只有在出现明显止跌与多因子共振时才有重新评估的意义。"
+                ),
+            },
+            "short": {
+                "tag": _tag(ratio_short),
+                "ratio": round(ratio_short, 2),
+                "reason": (
+                    f"价格已明显跌破前低区间（{prev_low:.1f}~{prev_high:.1f}），"
+                    f"空头参考以前低作为止损上方区域，以原区间高度做测幅，"
+                    f"当前下破后的结构性R:R约为 {ratio_short:.2f}。"
+                ),
+            },
+        }
+
+    # === 情况3：未突破，正常区间内（range mode） ===
+    # 回到对称结构
+    current_range_high = float(df["high"].max())
+    current_range_low = float(df["low"].min())
+    current_range_span = max(current_range_high - current_range_low, 1e-8)
+
+    risk_long = max(current - current_range_low, 1e-8)
+    reward_long = max(current_range_high - current, 0.0)
+    ratio_long = reward_long / risk_long if reward_long > 0 else 0.0
+
+    risk_short = max(current_range_high - current, 1e-8)
+    reward_short = max(current - current_range_low, 0.0)
+    ratio_short = reward_short / risk_short if reward_short > 0 else 0.0
+
+    long_pct_risk = risk_long / current_range_span
+    long_pct_reward = reward_long / current_range_span
+    short_pct_risk = risk_short / current_range_span
+    short_pct_reward = reward_short / current_range_span
+
+    return {
+        "mode": "range",
+        "long": {
+            "tag": _tag(ratio_long),
+            "ratio": round(ratio_long, 2),
+            "reason": (
+                f"当前价格位于近期区间内，做多参考区间低点作为风险边界，"
+                f"下方风险约占区间 {long_pct_risk:.1%}，上方空间约占 {long_pct_reward:.1%}。"
+            ),
+        },
+        "short": {
+            "tag": _tag(ratio_short),
+            "ratio": round(ratio_short, 2),
+            "reason": (
+                f"当前价格位于近期区间内，做空参考区间高点作为风险边界，"
+                f"上方风险约占区间 {short_pct_risk:.1%}，下方空间约占 {short_pct_reward:.1%}。"
+            ),
+        },
+    }
+
+def _translate_rr_tag(tag: str) -> str:
+    mapping = {
+        "favorable": "相对有利",
+        "neutral": "中性",
+        "unfavorable": "相对不利",
+        "unknown": "信息不足",
+    }
+    return mapping.get(tag, "中性")
+
+def format_risk_reward_for_prompt(rr: dict, trend_summary: str | None = None) -> str:
+    """
+    将双向R:R结果转为给 LLM 的自然语言说明。
+    trend_summary 可选：可传入你已有的趋势描述，提示模型“优先参考顺势一侧”。
+    """
+    long_info = rr.get("long", {})
+    short_info = rr.get("short", {})
+
+    long_tag = _translate_rr_tag(long_info.get("tag"))
+    short_tag = _translate_rr_tag(short_info.get("tag"))
+
+    long_ratio = long_info.get("ratio")
+    short_ratio = short_info.get("ratio")
+
+    # 字符串兜底，避免 None 拼接出错
+    long_ratio_str = f"{long_ratio:.2f}" if isinstance(long_ratio, (int, float)) else "?"
+    short_ratio_str = f"{short_ratio:.2f}" if isinstance(short_ratio, (int, float)) else "?"
+
+    lines = [
+        "【风险回报结构】（多空分向评估，仅基于区间结构，不代表必然走势）"]
+    
+
+    mode = rr.get("mode", "range")
+
+    if mode == "up_breakout":
+        lines.append("- 当前处于上破区间后的延伸阶段，请优先从多头角度评估结构是否健康，逆势做空仅在强烈反转信号下考虑。")
+    elif mode == "down_breakout":
+        lines.append("- 当前处于下破区间后的延伸阶段，请优先从空头角度评估结构是否健康，逆势做多仅在强烈止跌信号下考虑。")
+    else:
+        lines.append("- 当前价格尚在近期震荡区间内，可对多空方向分别从区间上下沿角度评估R:R。")
+
+    # 然后附上 long/short 的 tag、ratio、reason（保持我们上版风格）
+
+    lines += [
+        f"- 做多方向: {long_tag}（理论R:R≈{long_ratio_str}），{long_info.get('reason', '')}",
+        f"- 做空方向: {short_tag}（理论R:R≈{short_ratio_str}），{short_info.get('reason', '')}",
+        "",
+        "使用指引：",
+        "1. 优先结合当前趋势方向，参考与趋势同向一侧的风险回报；",
+        "2. 若某一方向为“相对不利”，仅在多因子强烈共振时才考虑；",
+        "3. 该评估不包含你的主观预测，仅提供区间结构上的风险/空间对比。",
+    ]
+
+    if trend_summary:
+        lines.append(f"4. 当前趋势概览：{trend_summary.strip()}")
+
+    return "\n".join(lines)
+
 def calculate_intelligent_position(signal_data, price_data, current_position):
     """计算智能仓位大小 - 修复版"""
     config = TRADE_CONFIG['position_management']
@@ -410,7 +1359,7 @@ def calculate_technical_indicators(df):
         # 移动平均线
         df['sma_5'] = df['close'].rolling(window=5, min_periods=1).mean()
         df['sma_20'] = df['close'].rolling(window=20, min_periods=1).mean()
-        df['sma_50'] = df['close'].rolling(window=50, min_periods=1).mean()
+        df['sma_80'] = df['close'].rolling(window=80, min_periods=1).mean()
 
         # 指数移动平均线
         df['ema_12'] = df['close'].ewm(span=12).mean()
@@ -573,7 +1522,7 @@ def get_market_trend(df):
 
         # 多时间框架趋势分析
         trend_short = "上涨" if current_price > df['sma_20'].iloc[-1] else "下跌"
-        trend_medium = "上涨" if current_price > df['sma_50'].iloc[-1] else "下跌"
+        trend_medium = "上涨" if current_price > df['sma_80'].iloc[-1] else "下跌"
 
         # MACD趋势
         macd_trend = "bullish" if df['macd'].iloc[-1] > df['macd_signal'].iloc[-1] else "bearish"
@@ -630,7 +1579,7 @@ def get_btc_ohlcv_enhanced():
             'technical_data': {
                 'sma_5': current_data.get('sma_5', 0),
                 'sma_20': current_data.get('sma_20', 0),
-                'sma_50': current_data.get('sma_50', 0),
+                'sma_80': current_data.get('sma_80', 0),
                 'rsi': current_data.get('rsi', 0),
                 'macd': current_data.get('macd', 0),
                 'macd_signal': current_data.get('macd_signal', 0),
@@ -657,6 +1606,13 @@ def generate_technical_analysis_text(price_data):
     tech = price_data['technical_data']
     trend = price_data.get('trend_analysis', {})
     levels = price_data.get('levels_analysis', {})
+    sma_analysis_text = generate_sma_analysis(price_data)
+    momentum_analysis_text = generate_momentum_analysis(price_data)
+    boll_text = generate_bollinger_analysis(price_data)
+    overheat = evaluate_overheat(price_data)
+    pvp = evaluate_price_volume_pattern(price_data)
+    risk_reward = compute_risk_reward_for_sides(price_data)
+    risk_reward_text = format_risk_reward_for_prompt(risk_reward, trend_summary=None)
 
     # 检查数据有效性
     def safe_float(value, default=0):
@@ -664,27 +1620,31 @@ def generate_technical_analysis_text(price_data):
 
     analysis_text = f"""
     【技术指标分析】
-    📈 移动平均线:
-    - 5周期: {safe_float(tech['sma_5']):.2f} | 价格相对: {(price_data['price'] - safe_float(tech['sma_5'])) / safe_float(tech['sma_5']) * 100:+.2f}%
-    - 20周期: {safe_float(tech['sma_20']):.2f} | 价格相对: {(price_data['price'] - safe_float(tech['sma_20'])) / safe_float(tech['sma_20']) * 100:+.2f}%
-    - 50周期: {safe_float(tech['sma_50']):.2f} | 价格相对: {(price_data['price'] - safe_float(tech['sma_50'])) / safe_float(tech['sma_50']) * 100:+.2f}%
+    {sma_analysis_text}
 
     🎯 趋势分析:
     - 短期趋势: {trend.get('short_term', 'N/A')}
     - 中期趋势: {trend.get('medium_term', 'N/A')}
     - 整体趋势: {trend.get('overall', 'N/A')}
-    - MACD方向: {trend.get('macd', 'N/A')}
+    - MACD方向（提供趋势动能强度判断）: {trend.get('macd', 'N/A')}
 
-    📊 动量指标:
-    - RSI: {safe_float(tech['rsi']):.2f} ({'超买' if safe_float(tech['rsi']) > 70 else '超卖' if safe_float(tech['rsi']) < 30 else '中性'})
-    - MACD: {safe_float(tech['macd']):.4f}
-    - 信号线: {safe_float(tech['macd_signal']):.4f}
+    {momentum_analysis_text}
 
-    🎚️ 布林带位置: {safe_float(tech['bb_position']):.2%} ({'上部' if safe_float(tech['bb_position']) > 0.7 else '下部' if safe_float(tech['bb_position']) < 0.3 else '中部'})
+    {boll_text}
 
     💰 关键水平:
     - 静态阻力: {safe_float(levels.get('static_resistance', 0)):.2f}
     - 静态支撑: {safe_float(levels.get('static_support', 0)):.2f}
+
+    【动能透支评估 - 系统辅助信息】
+        - 当前透支等级: {overheat["level"]}
+        - 参考信号: { "；".join(overheat["factors"]) if overheat["factors"] else "无明显透支信号" }
+    
+    【量价结构评估】
+        - 当前形态标签: {pvp['label']}
+        - 参考说明: {"；".join(pvp["reasons"]) if pvp.get("reasons") else "无明显异常信号"}
+
+    {risk_reward_text}
     """
     return analysis_text
 
@@ -746,6 +1706,33 @@ def create_fallback_signal(price_data):
         "is_fallback": True
     }
 
+def format_sentiment_text(sentiment_data):
+        if not sentiment_data:
+            return "【市场情绪】数据暂不可用"
+
+        sign = '+' if sentiment_data['net_sentiment'] >= 0 else ''
+        base = (
+            f"【市场情绪】乐观{sentiment_data['positive_ratio']:.1%} "
+            f"悲观{sentiment_data['negative_ratio']:.1%} "
+            f"净值{sign}{sentiment_data['net_sentiment']:.3f}"
+        )
+
+        delay = sentiment_data.get("data_delay_minutes", None)
+        if delay is None:
+            # 没有延迟信息就不多说
+            return base
+
+        # 新鲜度分级（本地机械逻辑）
+        if delay <= 15:
+            freshness = "（情绪数据较新，可作为辅助验证信号使用。）"
+        elif delay <= 45:
+            freshness = "（情绪数据存在一定延迟，可在分析中注明为延迟背景信息。）"
+        elif delay <= 90:
+            freshness = "（情绪数据明显滞后，更接近早前状态，可结合说明使用。）"
+        else:
+            freshness = "（情绪数据严重滞后，可视为历史参考，并在推理中集中描述技术面观察。）"
+
+        return base + " " + freshness
 
 def analyze_with_deepseek(price_data):
     """使用DeepSeek分析市场并生成交易信号（增强版）"""
@@ -754,27 +1741,24 @@ def analyze_with_deepseek(price_data):
     technical_analysis = generate_technical_analysis_text(price_data)
 
     # 构建K线数据文本
-    recent_n = TRADE_CONFIG.get('recent_kline_count', 20)
-    kline_text = f"【最近{recent_n}根{TRADE_CONFIG['timeframe']}K线数据】\n"
-    for i, kline in enumerate(price_data['kline_data'][-recent_n:]):
-        trend = "阳线" if kline['close'] > kline['open'] else "阴线"
-        change = ((kline['close'] - kline['open']) / kline['open']) * 100
-        kline_text += f"K线{i + 1}: {trend} 开盘:{kline['open']:.2f} 收盘:{kline['close']:.2f} 涨跌:{change:+.2f}%\n"
+    # recent_n = TRADE_CONFIG.get('recent_kline_count', 20)
+    # kline_text = f"【最近{recent_n}根{TRADE_CONFIG['timeframe']}K线数据(K线{recent_n}为最新数据)】\n"
+    # for i, kline in enumerate(price_data['kline_data'][-recent_n:]):
+    #     trend = "阳线" if kline['close'] > kline['open'] else "阴线"
+    #     change = ((kline['close'] - kline['open']) / kline['open']) * 100
+    #     kline_text += f"    K线{i + 1}: {trend} 开盘:{kline['open']:.2f} 收盘:{kline['close']:.2f} 涨跌:{change:+.2f}%\n"
+    price_action_tags = generate_price_action_tags(price_data)
+    price_action_text = "   【K线形态或价格结构信号】\n     " + format_price_action_tags_for_llm(price_action_tags)
 
     # 添加上次交易信号
     signal_text = ""
     if signal_history:
         last_signal = signal_history[-1]
-        signal_text = f"\n【上次交易信号】\n信号: {last_signal.get('signal', 'N/A')}\n信心: {last_signal.get('confidence', 'N/A')}"
+        signal_text = f"\n  【上次交易信号】\n信号: {last_signal.get('signal', 'N/A')}\n信心: {last_signal.get('confidence', 'N/A')}"
 
     # 获取情绪数据
     sentiment_data = get_sentiment_indicators_with_retry()
-    # 简化情绪文本 多了没用
-    if sentiment_data:
-        sign = '+' if sentiment_data['net_sentiment'] >= 0 else ''
-        sentiment_text = f"【市场情绪】乐观{sentiment_data['positive_ratio']:.1%} 悲观{sentiment_data['negative_ratio']:.1%} 净值{sign}{sentiment_data['net_sentiment']:.3f}"
-    else:
-        sentiment_text = "【市场情绪】数据暂不可用"
+    sentiment_text = format_sentiment_text(sentiment_data)
 
     # 添加当前持仓信息
     current_pos = get_current_position()
@@ -784,7 +1768,115 @@ def analyze_with_deepseek(price_data):
     prompt = f"""
     你是一个专业的加密货币交易分析师。请基于以下{get_human_pair()} {TRADE_CONFIG['timeframe']}周期数据进行分析：
 
-    {kline_text}
+    【趋势优先决策矩阵】
+        当以下条件同时满足：
+            - 多个周期趋势同向（例如短期与中期均线均为空头或多头）；
+            - MACD 与趋势方向一致；
+            - 动能透支等级为 none；
+            - 量价结构为 normal 或 clean；
+        则本次决策应倾向顺势方向给出 BUY 或 SELL 信号，且置信度至少为 MEDIUM，除非系统已明确标记风险回报结构明确不利。
+
+    【市场分析通用原则】
+        - 趋势信息是主导信号，但应结合动量与结构确认，避免过度解读单一强势。
+        - 若多项指标方向一致，可提高趋势信心；若指标冲突，请在分析中描述冲突并说明取舍。
+        - 动能、布林带、成交量等信号用于验证趋势的可持续性，而非替代趋势本身。
+        - 请基于技术面、结构与系统提供的辅助信息（透支、情绪、量价），综合评估信号强度。
+
+    【风险与仓位建议】
+        - 根据系统输出的综合信号，合理判断信心等级（HIGH / MEDIUM / LOW）。
+        - 当检测到透支、假突破或情绪滞后时，请描述这些因素如何影响仓位或信号解读。
+        - 当信号一致且风险低时，可在对应方向中等仓位参与，但仍应提供风险说明。
+        - 不需要引用历史持仓、盈亏或账户信息，它们不在模型输入范围内。
+
+    【结构化辅助说明】
+        系统还会提供以下内容供参考：
+            - 动能透支等级（none/mild/strong）
+            - 情绪信号新鲜度说明
+            - 量价结构评估标签（clean/weak/fake/normal）
+            - 你应将这些内容作为上下文的结构化提示信息使用，而非机械指令。请始终以解释性思维阐述交易理由。
+
+    【趋势与风险平衡原则】
+        1. 趋势优先，但要识别“透支风险”：
+            - 当短期与中期均线方向一致、价格沿同一方向运行时，可以优先考虑顺势交易（无论多空）。
+            - 但如果此时多项信号同时指向“行情可能已经接近阶段尾声”（例如：价格连续创高/创低但动能放缓、动量指标处于极值区间、价格多次触及通道边缘等），你可以根据这些信号调整顺势方向的信心描述，而不是简单视为更强信号。
+        2. 请主动识别以下“可能透支”的组合特征（不限于固定阈值）：
+            - 价格处于近期波动区间的极端位置（上沿或下沿）；
+            - 动量指标在极值区域但边际增量减弱（如MACD柱体缩短、RSI在高位或低位横盘等）；
+            - 突破后缺乏持续跟进（如放量冲高后回落、放量杀跌后拉回、影线明显等）。
+            遇到这些情况，可以：
+                - 说明是否需要调整信号置信度；
+                - 描述仓位安排或观望思路；
+                - 给出“等待更好入场位置”等结论的依据。
+        3. 在趋势延续且无明显透支迹象时：
+            - 你可以给出与趋势同向的BUY或SELL信号，并根据技术结构和波动环境给出合理的置信度和仓位建议。
+            - 不需要机械依赖某一个指标的单点阈值，而是综合评估多项信息的一致性与可持续性。
+        4. 若技术信号之间存在明显冲突：
+            - 例如：趋势看多，但多项信号提示可能见顶或动能衰减，
+            - 可在理由中阐述冲突点，并说明你选择更保守、小仓或继续持仓方案的原因。
+
+    【K线形态与结构线索使用原则】
+        将这些标签视为：
+            - 判断突破有效性/假突破嫌疑
+            - 判断冲顶/衰竭/趋势延续/震荡犹豫
+        的辅助证据，而不是机械信号。
+        如认为存在明显假突破或冲顶迹象，请在推理说明中指出“对应的标签依据”，并在最终JSON决策中体现你的判断。
+
+    【动能透支处理原则】
+        你会收到一段“动能透支评估 - 系统辅助信息”，其中包含 level（none/mild/strong）以及参考信号说明。
+        请按以下方式理解和使用（这是思考方向，而不是死规则）：
+
+        - 若 level = "strong":
+            - 表示阶段性风险信号集中；
+            - 可在结论中说明这对顺势信心或仓位的影响，如仍顺势操作需给出充分依据。
+
+        - 若 level = "mild":
+            - 说明出现部分极值或动能放缓迹象；
+            - 请描述你如何评估这些迹象，并据此安排仓位、置信度或策略。
+
+        - 若 level = "none":
+            - 代表当前未检测到明显透支信号，可聚焦趋势与结构本身的判断。
+
+        在任何情况下，请综合 K线结构、趋势、动量、布林带和情绪，而不是仅凭“强势”或单一信号就下结论。
+    
+    【情绪信号使用原则】
+        - 你会在【市场情绪】后面看到一段关于“数据是否新鲜”的说明（例如：数据较新 / 存在延迟 / 明显滞后 / 请忽略情绪）。
+        - 当说明为“数据较新”时，可以将情绪视为技术信号的辅助放大因素，前提是技术面本身合理。
+        - 当说明为“存在延迟”或“明显滞后”时，请在推理中注明延迟背景，并将情绪内容作为背景描述使用。
+        - 当说明为“请忽略情绪信号”时，可以完全基于技术面与结构，并在理由中说明情绪未被采用。
+        - 不需要根据具体分钟数做机械判断，请根据说明语义综合考量。
+
+    【量价与突破信号使用原则】
+        - 你会看到一段【量价结构评估】，其中包含:
+            - 当前形态标签(label): clean_breakout / possible_fake_breakout / weak_breakout / normal
+            - 若干参考说明(reasons)。
+        - 当标签为 clean_breakout 时：
+            - 可以更信任当前突破的有效性，但仍需结合趋势与风险管理，不等于盲目追涨或杀跌。
+        - 当标签为 possible_fake_breakout 或 weak_breakout 时：
+            - 这些标签提示需要明确描述潜在风险：
+                - 说明是否调整顺势信心、仓位或观望计划；
+                - 如仍选择顺势参与，请在理由中写明为何认为风险可控或信号有效。
+        - 当标签为 normal 时：
+            - 说明当前量价关系中性，你可以主要依据趋势、动量和结构来决策。
+        以上内容是供你参考的结构化线索，而不是机械规则。请在综合全部上下文后，给出有解释的交易判断。
+    
+    【重要】请基于技术分析做出明确判断，避免因过度谨慎而错过趋势行情！
+    【重要2】任何指标如果接近边界值或者越界，不排除是有突破的可能性!
+
+    【分析要求】
+    基于以上规则，结合后续我提供的实盘数据，请给出明确的交易信号
+
+    请用以下JSON格式回复：
+    {{
+        "signal": "BUY|SELL|HOLD",
+        "reason": "简要分析理由(包含趋势判断和技术依据)",
+        "stop_loss": 具体价格,
+        "take_profit": 具体价格, 
+        "confidence": "HIGH|MEDIUM|LOW"
+    }}
+    
+    ---------------以下是实盘数据部分-------------------------
+
+    {price_action_text}
 
     {technical_analysis}
 
@@ -801,70 +1893,6 @@ def analyze_with_deepseek(price_data):
     - 价格变化: {price_data['price_change']:+.2f}%
     - 当前持仓: {position_text}{pnl_text}
 
-    【防频繁交易重要原则】
-    1. **趋势持续性优先**: 不要因单根K线或短期波动改变整体趋势判断
-    2. **持仓稳定性**: 除非趋势明确强烈反转，否则保持现有持仓方向
-    3. **反转确认**: 需要至少2-3个技术指标同时确认趋势反转才改变信号
-    4. **成本意识**: 减少不必要的仓位调整，每次交易都有成本
-
-    【交易指导原则 - 必须遵守】
-    1. **技术分析主导** (权重60%)：趋势、支撑阻力、K线形态是主要依据
-    2. **市场情绪辅助** (权重30%)：情绪数据用于验证技术信号，不能单独作为交易理由  
-    - 情绪与技术同向 → 增强信号信心
-    - 情绪与技术背离 → 以技术分析为主，情绪仅作参考
-    - 情绪数据延迟 → 降低权重，以实时技术指标为准
-    3. **风险管理** (权重10%)：考虑持仓、盈亏状况和止损位置
-    4. **趋势跟随**: 明确趋势出现时立即行动，不要过度等待
-    5. 因为做的是eth，做多权重可以大一点点
-    6. **信号明确性**:
-    - 强势上涨趋势 → BUY信号
-    - 强势下跌趋势 → SELL信号  
-    - 仅在窄幅震荡、无明确方向时 → HOLD信号
-    7. **技术指标权重**:
-    - 趋势(均线排列) > RSI > MACD > 布林带
-    - 价格突破关键支撑/阻力位是重要信号 
-
-
-    【当前技术状况分析】
-    - 整体趋势: {price_data['trend_analysis'].get('overall', 'N/A')}
-    - 短期趋势: {price_data['trend_analysis'].get('short_term', 'N/A')} 
-    - RSI状态: {price_data['technical_data'].get('rsi', 0):.1f} ({'超买' if price_data['technical_data'].get('rsi', 0) > 70 else '超卖' if price_data['technical_data'].get('rsi', 0) < 30 else '中性'})
-    - MACD方向: {price_data['trend_analysis'].get('macd', 'N/A')}
-
-    【智能仓位管理规则 - 必须遵守】
-
-    1. **减少过度保守**：
-       - 明确趋势中不要因轻微超买/超卖而过度HOLD
-       - RSI在30-70区间属于健康范围，不应作为主要HOLD理由
-       - 布林带位置在20%-80%属于正常波动区间
-
-    2. **趋势跟随优先**：
-       - 强势上涨趋势 + 任何RSI值 → 积极BUY信号
-       - 强势下跌趋势 + 任何RSI值 → 积极SELL信号
-       - 震荡整理 + 无明确方向 → HOLD信号
-
-    3. **突破交易信号**：
-       - 价格突破关键阻力 + 成交量放大 → 高信心BUY
-       - 价格跌破关键支撑 + 成交量放大 → 高信心SELL
-
-    4. **持仓优化逻辑**：
-       - 已有持仓且趋势延续 → 保持或BUY/SELL信号
-       - 趋势明确反转 → 及时反向信号
-       - 不要因为已有持仓而过度HOLD
-
-    【重要】请基于技术分析做出明确判断，避免因过度谨慎而错过趋势行情！
-
-    【分析要求】
-    基于以上分析，请给出明确的交易信号
-
-    请用以下JSON格式回复：
-    {{
-        "signal": "BUY|SELL|HOLD",
-        "reason": "简要分析理由(包含趋势判断和技术依据)",
-        "stop_loss": 具体价格,
-        "take_profit": 具体价格, 
-        "confidence": "HIGH|MEDIUM|LOW"
-    }}
     """
 
     # 可选打印构造的Prompt，便于调试与复查
@@ -940,10 +1968,16 @@ def execute_intelligent_trade(signal_data, price_data):
     did_reverse = False
 
     current_position = get_current_position()
+    require_high_conf = TRADE_CONFIG.get('require_high_confidence_entry', True)
     print(f"当前持仓: {current_position}")
 
     # 无持仓时仅接受高信心开仓信号
-    if not current_position and signal_data['signal'] in {'BUY', 'SELL'} and signal_data['confidence'] != 'HIGH':
+    if (
+        require_high_conf
+        and not current_position
+        and signal_data['signal'] in {'BUY', 'SELL'}
+        and signal_data['confidence'] != 'HIGH'
+    ):
         print("🔒 当前无持仓，仅高信心信号才允许开仓，跳过执行")
         _record_reverse_close_event(False)
         return
@@ -961,7 +1995,7 @@ def execute_intelligent_trade(signal_data, price_data):
 
         # 如果方向相反，需要高信心才执行
         if new_side != current_side:
-            if signal_data['confidence'] != 'HIGH':
+            if require_high_conf and signal_data['confidence'] != 'HIGH':
                 print(f"🔒 非高信心反转信号，保持现有{current_side}仓")
                 _record_reverse_close_event(False)
                 return
@@ -1257,7 +2291,7 @@ def main():
     if TRADE_CONFIG['test_mode']:
         print("当前为模拟模式，不会真实下单")
     else:
-        print("实盘交易模式，请谨慎操作！")
+        print("实盘交易模式，指令将直接作用于账户。")
 
     print(f"交易周期: {TRADE_CONFIG['timeframe']}")
     print("已启用完整技术指标分析和持仓跟踪功能")

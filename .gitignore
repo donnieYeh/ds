@@ -1,0 +1,4 @@
+# 过滤pycache
+__pycache__/
+# 过滤.idea/
+.idea/

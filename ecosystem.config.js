@@ -20,6 +20,7 @@ module.exports = {
       restart_delay: 3000,
       env: {
         PRINT_PROMPT: 'True',
+        REQUIRE_HIGH_CONFIDENCE_ENTRY: 'True',
         // You can also set RECENT_KLINE_COUNT here, e.g. '20'
         // RECENT_KLINE_COUNT: '20'
       }
