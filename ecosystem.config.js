@@ -23,6 +23,10 @@ module.exports = {
         REQUIRE_HIGH_CONFIDENCE_ENTRY: 'True',
         // You can also set RECENT_KLINE_COUNT here, e.g. '20'
         // RECENT_KLINE_COUNT: '20'
+        // ADX periods (default short=14, long=21; long uses smoothing from the short period by default)
+        // ADX_SHORT_PERIOD: '14',
+        // ADX_LONG_PERIOD: '21',
+        // ADX_SMOOTHING_PERIOD: '14',
       }
     },
     {
