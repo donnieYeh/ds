@@ -48,6 +48,18 @@ def _get_bool_env(name: str, default: bool = False) -> bool:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
 
+
+def _get_int_env(name: str, default: int, min_value: int = 1, max_value: int | None = None) -> int:
+    """读取整数环境变量并应用边界。"""
+    try:
+        val = int(os.getenv(name, default))
+        if max_value is not None:
+            val = min(max_value, val)
+        val = max(min_value, val)
+        return val
+    except Exception:
+        return default
+
 # 初始化OKX交易所
 exchange = ccxt.okx({
     'options': {
@@ -59,6 +71,10 @@ exchange = ccxt.okx({
 })
 
 # 交易参数配置 - 结合两个版本的优点
+ADX_SHORT_DEFAULT = _get_int_env('ADX_SHORT_PERIOD', 14, 1, 400)
+ADX_LONG_DEFAULT = _get_int_env('ADX_LONG_PERIOD', 21, 1, 400)
+ADX_SMOOTHING_DEFAULT = _get_int_env('ADX_SMOOTHING_PERIOD', ADX_SHORT_DEFAULT, 1, 400)
+
 TRADE_CONFIG = {
     'symbol': get_asset_symbol(),  # 由外部override提供
     'leverage': 10,  # 杠杆倍数,只影响保证金不影响下单价值
@@ -82,6 +98,11 @@ TRADE_CONFIG = {
         'low_confidence_multiplier': 0.5,
         'max_position_ratio': 10,  # 单次最大仓位比例
         'trend_strength_multiplier': 1.2
+    },
+    'adx_periods': {
+        'short': ADX_SHORT_DEFAULT,
+        'long': ADX_LONG_DEFAULT,
+        'smoothing': ADX_SMOOTHING_DEFAULT,
     }
 }
 
@@ -121,6 +142,23 @@ def print_runtime_config():
             f"- 高信心开单限制: {'启用' if require_high else '禁用'}"
             + (f"  (来自环境变量 REQUIRE_HIGH_CONFIDENCE_ENTRY={env_require_high})" if env_require_high is not None else "")
         )
+        adx_cfg = cfg.get('adx_periods', {})
+        env_adx_short = os.getenv('ADX_SHORT_PERIOD')
+        env_adx_long = os.getenv('ADX_LONG_PERIOD')
+        env_adx_smoothing = os.getenv('ADX_SMOOTHING_PERIOD')
+        adx_line = (
+            f"- ADX周期: 短期={adx_cfg.get('short')} 长期={adx_cfg.get('long')} 平滑={adx_cfg.get('smoothing')}"
+        )
+        if any([env_adx_short, env_adx_long, env_adx_smoothing]):
+            adx_line += "  (来自环境变量"
+            if env_adx_short:
+                adx_line += f" ADX_SHORT_PERIOD={env_adx_short}"
+            if env_adx_long:
+                adx_line += f" ADX_LONG_PERIOD={env_adx_long}"
+            if env_adx_smoothing:
+                adx_line += f" ADX_SMOOTHING_PERIOD={env_adx_smoothing}"
+            adx_line += ")"
+        print(adx_line)
     except Exception as e:
         print(f"⚠️ 配置打印失败: {e}")
 
@@ -320,6 +358,38 @@ def calculate_intelligent_position_v2(signal_data, price_data, current_position)
     except Exception:
         # fallback: fixed tiny contract
         return max(TRADE_CONFIG.get('min_amount', 0.01), 0.01)
+
+
+def calculate_adx(df, period: int, smoothing_period: int):
+    """计算给定周期的ADX指标，支持单独的平滑周期。"""
+    try:
+        high = df['high']
+        low = df['low']
+        close = df['close']
+
+        high_diff = high.diff()
+        low_diff = low.diff() * -1
+
+        plus_dm = high_diff.where((high_diff > low_diff) & (high_diff > 0), 0)
+        minus_dm = low_diff.where((low_diff > high_diff) & (low_diff > 0), 0)
+
+        tr = pd.concat([
+            high - low,
+            (high - close.shift()).abs(),
+            (low - close.shift()).abs()
+        ], axis=1).max(axis=1)
+
+        atr = tr.ewm(alpha=1 / smoothing_period, adjust=False).mean()
+        plus_di = 100 * plus_dm.ewm(alpha=1 / smoothing_period, adjust=False).mean() / atr
+        minus_di = 100 * minus_dm.ewm(alpha=1 / smoothing_period, adjust=False).mean() / atr
+
+        dx = (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, pd.NA)
+        adx = (dx * 100).ewm(alpha=1 / period, adjust=False).mean()
+
+        return adx
+    except Exception as e:
+        print(f"ADX计算失败: {e}")
+        return pd.Series([0] * len(df), index=df.index)
 
 
 def generate_sma_analysis(source, short=5, mid=20, long=80, price_col="close"):
@@ -1356,6 +1426,10 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
 def calculate_technical_indicators(df):
     """计算技术指标 - 来自第一个策略"""
     try:
+        adx_short_period = TRADE_CONFIG.get('adx_periods', {}).get('short', 14)
+        adx_long_period = TRADE_CONFIG.get('adx_periods', {}).get('long', 21)
+        adx_smoothing_period = TRADE_CONFIG.get('adx_periods', {}).get('smoothing', adx_short_period)
+
         # 移动平均线
         df['sma_5'] = df['close'].rolling(window=5, min_periods=1).mean()
         df['sma_20'] = df['close'].rolling(window=20, min_periods=1).mean()
@@ -1389,6 +1463,10 @@ def calculate_technical_indicators(df):
         # 支撑阻力位
         df['resistance'] = df['high'].rolling(20).max()
         df['support'] = df['low'].rolling(20).min()
+
+        # ADX 指标（长期使用短周期平滑）
+        df['adx_short'] = calculate_adx(df, adx_short_period, adx_smoothing_period)
+        df['adx_long'] = calculate_adx(df, adx_long_period, adx_smoothing_period)
 
         # 填充NaN值
         df = df.bfill().ffill()
@@ -1587,7 +1665,9 @@ def get_btc_ohlcv_enhanced():
                 'bb_upper': current_data.get('bb_upper', 0),
                 'bb_lower': current_data.get('bb_lower', 0),
                 'bb_position': current_data.get('bb_position', 0),
-                'volume_ratio': current_data.get('volume_ratio', 0)
+                'volume_ratio': current_data.get('volume_ratio', 0),
+                'adx_short': current_data.get('adx_short', 0),
+                'adx_long': current_data.get('adx_long', 0),
             },
             'trend_analysis': trend_analysis,
             'levels_analysis': levels_analysis,
@@ -1969,6 +2049,36 @@ def execute_intelligent_trade(signal_data, price_data):
 
     current_position = get_current_position()
     require_high_conf = TRADE_CONFIG.get('require_high_confidence_entry', True)
+    new_side = None
+    if signal_data['signal'] == 'BUY':
+        new_side = 'long'
+    elif signal_data['signal'] == 'SELL':
+        new_side = 'short'
+
+    def adx_conditions_met():
+        adx_data = price_data.get('technical_data', {}) or {}
+        full_df = price_data.get('full_data')
+        long_adx_series = None
+        if isinstance(full_df, pd.DataFrame) and 'adx_long' in full_df.columns:
+            long_adx_series = full_df['adx_long']
+
+        short_adx = adx_data.get('adx_short')
+
+        if long_adx_series is None or len(long_adx_series) < 2:
+            return False, "ADX长周期数据不足"
+
+        is_long_rising = long_adx_series.iloc[-1] > long_adx_series.iloc[-2]
+        short_adx_threshold = short_adx is not None and short_adx > 20
+
+        if short_adx_threshold and is_long_rising:
+            return True, "ADX 条件满足"
+
+        reasons = []
+        if not short_adx_threshold:
+            reasons.append(f"ADX({TRADE_CONFIG['adx_periods'].get('short', 14)}) 未超过20")
+        if not is_long_rising:
+            reasons.append("ADX长周期未上升")
+        return False, "，".join(reasons)
     print(f"当前持仓: {current_position}")
 
     # 无持仓时仅接受高信心开仓信号
@@ -1985,13 +2095,6 @@ def execute_intelligent_trade(signal_data, price_data):
     # 防止频繁反转的逻辑保持不变
     if current_position and signal_data['signal'] != 'HOLD':
         current_side = current_position['side']  # 'long' 或 'short'
-
-        if signal_data['signal'] == 'BUY':
-            new_side = 'long'
-        elif signal_data['signal'] == 'SELL':
-            new_side = 'short'
-        else:
-            new_side = None
 
         # 如果方向相反，需要高信心才执行
         if new_side != current_side:
@@ -2028,6 +2131,16 @@ def execute_intelligent_trade(signal_data, price_data):
         print("测试模式 - 仅模拟交易")
         _record_reverse_close_event(False)
         return
+
+    requires_entry = new_side is not None and (not current_position or current_position['side'] != new_side)
+    if requires_entry:
+        adx_ok, adx_reason = adx_conditions_met()
+        if not adx_ok:
+            print(f"⛔️ ADX 条件未满足，跳过开仓: {adx_reason}")
+            _record_reverse_close_event(False)
+            return
+        else:
+            print(f"✅ ADX 条件通过: {adx_reason}")
 
     try:
         # 执行交易逻辑 - 支持同方向加仓减仓
