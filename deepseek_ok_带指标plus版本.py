@@ -42,6 +42,10 @@ TRADE_CONFIG = {
         'short_term': 20,  # 短期均线
         'medium_term': 50,  # 中期均线
         'long_term': 96  # 长期趋势
+    },
+    'adx_periods': {
+        'short': 14,
+        'long': 21
     }
 }
 
@@ -235,9 +239,44 @@ def setup_exchange():
         return False
 
 
+def calculate_adx(df, period):
+    """计算给定周期的ADX指标"""
+    try:
+        high = df['high']
+        low = df['low']
+        close = df['close']
+
+        high_diff = high.diff()
+        low_diff = low.diff() * -1
+
+        plus_dm = high_diff.where((high_diff > low_diff) & (high_diff > 0), 0)
+        minus_dm = low_diff.where((low_diff > high_diff) & (low_diff > 0), 0)
+
+        tr = pd.concat([
+            high - low,
+            (high - close.shift()).abs(),
+            (low - close.shift()).abs()
+        ], axis=1).max(axis=1)
+
+        atr = tr.ewm(alpha=1 / period, adjust=False).mean()
+        plus_di = 100 * plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr
+        minus_di = 100 * minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr
+
+        dx = (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, pd.NA)
+        adx = (dx * 100).ewm(alpha=1 / period, adjust=False).mean()
+
+        return adx
+    except Exception as e:
+        print(f"ADX计算失败: {e}")
+        return pd.Series([0] * len(df), index=df.index)
+
+
 def calculate_technical_indicators(df):
     """计算技术指标 - 来自第一个策略"""
     try:
+        adx_short_period = TRADE_CONFIG.get('adx_periods', {}).get('short', 14)
+        adx_long_period = TRADE_CONFIG.get('adx_periods', {}).get('long', 21)
+
         # 移动平均线
         df['sma_5'] = df['close'].rolling(window=5, min_periods=1).mean()
         df['sma_20'] = df['close'].rolling(window=20, min_periods=1).mean()
@@ -271,6 +310,10 @@ def calculate_technical_indicators(df):
         # 支撑阻力位
         df['resistance'] = df['high'].rolling(20).max()
         df['support'] = df['low'].rolling(20).min()
+
+        # ADX 指标
+        df['adx_short'] = calculate_adx(df, adx_short_period)
+        df['adx_long'] = calculate_adx(df, adx_long_period)
 
         # 填充NaN值
         df = df.bfill().ffill()
@@ -380,7 +423,9 @@ def get_symbol_ohlcv_enhanced():
                 'bb_upper': current_data.get('bb_upper', 0),
                 'bb_lower': current_data.get('bb_lower', 0),
                 'bb_position': current_data.get('bb_position', 0),
-                'volume_ratio': current_data.get('volume_ratio', 0)
+                'volume_ratio': current_data.get('volume_ratio', 0),
+                'adx_short': current_data.get('adx_short', 0),
+                'adx_long': current_data.get('adx_long', 0)
             },
             'trend_analysis': trend_analysis,
             'levels_analysis': levels_analysis,
@@ -634,6 +679,29 @@ def execute_trade(signal_data, price_data):
 
     current_position = get_current_position()
 
+    def adx_conditions_met():
+        adx_data = price_data.get('technical_data', {})
+        long_adx_series = price_data.get('full_data', pd.DataFrame()).get('adx_long')
+
+        short_adx = adx_data.get('adx_short')
+
+        if long_adx_series is None or len(long_adx_series) < 2:
+            return False, "ADX长周期数据不足"
+
+        is_long_rising = long_adx_series.iloc[-1] > long_adx_series.iloc[-2]
+        short_adx_threshold = short_adx is not None and short_adx > 20
+
+        if short_adx_threshold and is_long_rising:
+            return True, "ADX 条件满足"
+
+        reason_parts = []
+        if not short_adx_threshold:
+            reason_parts.append(f"ADX({TRADE_CONFIG['adx_periods'].get('short', 14)}) 未超过20")
+        if not is_long_rising:
+            reason_parts.append("ADX长周期未上升")
+
+        return False, "，".join(reason_parts)
+
     # 🔴 紧急修复：防止频繁反转
     if current_position and signal_data['signal'] != 'HOLD':
         current_side = current_position['side']
@@ -673,6 +741,22 @@ def execute_trade(signal_data, price_data):
     if TRADE_CONFIG['test_mode']:
         print("测试模式 - 仅模拟交易")
         return
+
+    new_side = None
+    if signal_data['signal'] == 'BUY':
+        new_side = 'long'
+    elif signal_data['signal'] == 'SELL':
+        new_side = 'short'
+
+    requires_entry = new_side is not None and (not current_position or current_position['side'] != new_side)
+
+    if requires_entry:
+        adx_ok, adx_reason = adx_conditions_met()
+        if not adx_ok:
+            print(f"⛔️ ADX 条件未满足，跳过开仓: {adx_reason}")
+            return
+        else:
+            print(f"✅ ADX 条件通过: {adx_reason}")
 
     try:
         # 获取账户余额
