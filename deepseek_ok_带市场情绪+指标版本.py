@@ -3,6 +3,7 @@ import time
 import schedule
 from openai import OpenAI
 import ccxt
+import numpy as np
 import pandas as pd
 import re
 from dotenv import load_dotenv
@@ -405,7 +406,9 @@ def calculate_adx(df, period: int, smoothing_period: int):
         plus_di = 100 * plus_dm.ewm(alpha=1 / smoothing_period, adjust=False).mean() / atr
         minus_di = 100 * minus_dm.ewm(alpha=1 / smoothing_period, adjust=False).mean() / atr
 
-        dx = (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, pd.NA)
+        denom = plus_di + minus_di
+        denom = denom.mask(denom == 0, np.nan)
+        dx = (plus_di - minus_di).abs() / denom
         adx = (dx * 100).ewm(alpha=1 / period, adjust=False).mean()
 
         return adx
@@ -430,8 +433,6 @@ def generate_sma_analysis(source, short=5, mid=20, long=80, price_col="close"):
         - price_data 字典：需包含 'full_data' (带有 sma_X 列) 与当前 price
         - DataFrame：需包含 close 及相应的 sma_X 列
     """
-    import numpy as np
-
     price_now = None
     df = None
     tech = {}

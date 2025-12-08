@@ -2,3 +2,4 @@
 __pycache__/
 # 过滤.idea/
 .idea/
+.venv/
