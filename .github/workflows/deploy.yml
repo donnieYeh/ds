@@ -29,12 +29,14 @@ jobs:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           PLUS_LOG_ADMIN_USER: ${{ vars.PLUS_LOG_ADMIN_USER }}
           PLUS_LOG_ADMIN_PASSWORD: ${{ secrets.PLUS_LOG_ADMIN_PASSWORD }}
+          ADX_PROTECT: ${{ vars.ADX_PROTECT }}
         run: |
           ssh -i ~/.ssh/id_rsa "$SSH_USER@$SSH_HOST" <<EOF
           source ~/.bashrc
           conda activate ds
           export PLUS_LOG_ADMIN_USER="${PLUS_LOG_ADMIN_USER}"
           export PLUS_LOG_ADMIN_PASSWORD="${PLUS_LOG_ADMIN_PASSWORD}"
+          export ADX_PROTECT="${ADX_PROTECT}"
           cd /git/ds/
           git pull
           pm2 reload ecosystem.config.js --update-env
