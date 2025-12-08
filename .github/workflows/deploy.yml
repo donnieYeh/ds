@@ -1,0 +1,41 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: product
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+
+      - name: Deploy to server
+        env:
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          PLUS_LOG_ADMIN_USER: ${{ vars.PLUS_LOG_ADMIN_USER }}
+          PLUS_LOG_ADMIN_PASSWORD: ${{ secrets.PLUS_LOG_ADMIN_PASSWORD }}
+        run: |
+          ssh -i ~/.ssh/id_rsa "$SSH_USER@$SSH_HOST" <<EOF
+          source ~/.bashrc
+          conda activate ds
+          export PLUS_LOG_ADMIN_USER="${PLUS_LOG_ADMIN_USER}"
+          export PLUS_LOG_ADMIN_PASSWORD="${PLUS_LOG_ADMIN_PASSWORD}"
+          cd /git/ds/
+          git pull
+          pm2 reload ecosystem.config.js --update-env
+          EOF

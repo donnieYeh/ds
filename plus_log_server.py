@@ -3,16 +3,19 @@ import threading
 import time
 from typing import List, Dict, Any
 
-from flask import Flask, jsonify, render_template, Blueprint
+from flask import Flask, jsonify, render_template, Blueprint, session, request, redirect, url_for
 
 from plus_log_parser import parse_plus_log
 
 
 LOG_PATH = os.environ.get("PLUS_LOG_PATH", os.path.join(os.getcwd(), "plus.out.log"))
 SCAN_INTERVAL_SEC = int(os.environ.get("PLUS_LOG_SCAN_INTERVAL", "60"))
+ADMIN_USERNAME = os.environ.get("PLUS_LOG_ADMIN_USER", "admin")
+ADMIN_PASSWORD = os.environ.get("PLUS_LOG_ADMIN_PASSWORD", "password")
 
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "plus-log-secret")
 bp = Blueprint("ds", __name__, url_prefix="/ds")
 
 _records: List[Dict[str, Any]] = []
@@ -54,6 +57,30 @@ def scanner_loop():
     while True:
         scan_once()
         time.sleep(SCAN_INTERVAL_SEC)
+
+
+@bp.before_request
+def require_login():
+    # Allow login page and health checks without authentication
+    if request.endpoint in {"ds.login", "ds.healthz"}:
+        return None
+    if session.get("ds_authenticated"):
+        return None
+    return redirect(url_for("ds.login", next=request.path))
+
+
+@bp.route("/login", methods=["GET", "POST"])
+def login():
+    error = None
+    if request.method == "POST":
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+            session["ds_authenticated"] = True
+            target = request.args.get("next") or url_for("ds.index")
+            return redirect(target)
+        error = "用户名或密码错误"
+    return render_template("login.html", error=error)
 
 
 @bp.route("/")

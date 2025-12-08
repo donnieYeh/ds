@@ -20,7 +20,7 @@ module.exports = {
       restart_delay: 3000,
       env: {
         PRINT_PROMPT: 'True',
-        REQUIRE_HIGH_CONFIDENCE_ENTRY: 'True',
+        REQUIRE_HIGH_CONFIDENCE_ENTRY: 'False',
         SENTIMENT_API_KEY: '711457e5-ef55-44b6-badc-9c45981eefe8',
         // You can also set RECENT_KLINE_COUNT here, e.g. '20'
         // RECENT_KLINE_COUNT: '20'
@@ -48,7 +48,9 @@ module.exports = {
       max_restarts: 10,
       restart_delay: 3000,
       env: {
-        PLUS_LOG_PATH: 'plus.out.log',
+        PLUS_LOG_PATH: process.env.PLUS_LOG_PATH || 'plus.out.log',
+        PLUS_LOG_ADMIN_USER: process.env.PLUS_LOG_ADMIN_USER || 'admin',
+        PLUS_LOG_ADMIN_PASSWORD: process.env.PLUS_LOG_ADMIN_PASSWORD || 'password',
       }
     }
   ]
