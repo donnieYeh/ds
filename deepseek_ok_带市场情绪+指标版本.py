@@ -81,6 +81,7 @@ TRADE_CONFIG = {
     'timeframe': '15m',  # 使用15分钟K线
     'test_mode': False,  # 测试模式
     'require_high_confidence_entry': _get_bool_env('REQUIRE_HIGH_CONFIDENCE_ENTRY', True),  # 是否仅允许高信心开单
+    'enable_adx_protect': _get_bool_env('ADX_PROTECT', True),
     'data_points': 96,  # 24小时数据（96根15分钟K线）
     'recent_kline_count': _get_recent_kline_count_default(),  # 近N根K线用于提示/决策
     'print_prompt': _get_bool_env('PRINT_PROMPT', False),  # 是否打印提示词
@@ -141,6 +142,12 @@ def print_runtime_config():
         print(
             f"- 高信心开单限制: {'启用' if require_high else '禁用'}"
             + (f"  (来自环境变量 REQUIRE_HIGH_CONFIDENCE_ENTRY={env_require_high})" if env_require_high is not None else "")
+        )
+        adx_protect = cfg.get('enable_adx_protect', True)
+        env_adx_protect = os.getenv('ADX_PROTECT')
+        print(
+            f"- ADX风控: {'启用' if adx_protect else '禁用'}"
+            + (f"  (来自环境变量 ADX_PROTECT={env_adx_protect})" if env_adx_protect is not None else "")
         )
         adx_cfg = cfg.get('adx_periods', {})
         env_adx_short = os.getenv('ADX_SHORT_PERIOD')
@@ -1436,6 +1443,19 @@ def calculate_technical_indicators(df):
         adx_long_period = TRADE_CONFIG.get('adx_periods', {}).get('long', 21)
         adx_smoothing_period = TRADE_CONFIG.get('adx_periods', {}).get('smoothing', adx_short_period)
 
+        print(
+            f"🔎 ADX计算准备: symbol={TRADE_CONFIG['symbol']} timeframe={TRADE_CONFIG['timeframe']} "
+            f"short={adx_short_period} long={adx_long_period} smoothing={adx_smoothing_period} 数据量={len(df)}"
+        )
+        try:
+            preview_cols = ['timestamp', 'open', 'high', 'low', 'close']
+            available_cols = [col for col in preview_cols if col in df.columns]
+            if available_cols:
+                print("📊 ADX数据源预览(最近5条):")
+                print(df[available_cols].tail(5))
+        except Exception as preview_err:
+            print(f"⚠️ ADX数据源预览失败: {preview_err}")
+
         # 移动平均线
         df['sma_5'] = df['close'].rolling(window=5, min_periods=1).mean()
         df['sma_20'] = df['close'].rolling(window=20, min_periods=1).mean()
@@ -1473,6 +1493,17 @@ def calculate_technical_indicators(df):
         # ADX 指标（长期使用短周期平滑）
         df['adx_short'] = calculate_adx(df, adx_short_period, adx_smoothing_period)
         df['adx_long'] = calculate_adx(df, adx_long_period, adx_smoothing_period)
+
+        try:
+            if len(df) >= 2:
+                print(
+                    f"📌 ADX计算结果: 短期({adx_short_period}) 最新={float(df['adx_short'].iloc[-1]):.2f} "
+                    f"上一根={float(df['adx_short'].iloc[-2]):.2f}; "
+                    f"长期({adx_long_period}) 最新={float(df['adx_long'].iloc[-1]):.2f} "
+                    f"上一根={float(df['adx_long'].iloc[-2]):.2f}"
+                )
+        except Exception as adx_log_err:
+            print(f"⚠️ ADX计算结果日志失败: {adx_log_err}")
 
         # 填充NaN值
         df = df.bfill().ffill()
@@ -2062,6 +2093,9 @@ def execute_intelligent_trade(signal_data, price_data):
         new_side = 'short'
 
     def adx_conditions_met():
+        if not TRADE_CONFIG.get('enable_adx_protect', True):
+            print("🟢 ADX风控开关已关闭，跳过ADX条件校验")
+            return True, "ADX风控未启用"
         adx_data = price_data.get('technical_data', {}) or {}
         full_df = price_data.get('full_data')
         long_adx_series = None
