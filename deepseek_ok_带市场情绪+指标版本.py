@@ -1426,6 +1426,12 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
 def calculate_technical_indicators(df):
     """计算技术指标 - 来自第一个策略"""
     try:
+        # 确保关键价格/成交量字段为数值型，避免滚动/指数平滑时报 "No numeric types to aggregate"
+        numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
         adx_short_period = TRADE_CONFIG.get('adx_periods', {}).get('short', 14)
         adx_long_period = TRADE_CONFIG.get('adx_periods', {}).get('long', 21)
         adx_smoothing_period = TRADE_CONFIG.get('adx_periods', {}).get('smoothing', adx_short_period)
