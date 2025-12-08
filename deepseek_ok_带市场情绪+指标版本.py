@@ -1471,14 +1471,6 @@ def calculate_technical_indicators(df):
             f"🔎 ADX计算准备: symbol={TRADE_CONFIG['symbol']} timeframe={TRADE_CONFIG['timeframe']} "
             f"short={adx_short_period} long={adx_long_period} smoothing={adx_smoothing_period} 数据量={len(df)}"
         )
-        try:
-            preview_cols = ['timestamp', 'open', 'high', 'low', 'close']
-            available_cols = [col for col in preview_cols if col in df.columns]
-            if available_cols:
-                print("📊 ADX数据源预览(最近5条):")
-                print(df[available_cols].tail(5))
-        except Exception as preview_err:
-            print(f"⚠️ ADX数据源预览失败: {preview_err}")
 
         # 移动平均线
         df['sma_5'] = df['close'].rolling(window=5, min_periods=1).mean()

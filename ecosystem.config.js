@@ -21,7 +21,7 @@ module.exports = {
       env: {
         PRINT_PROMPT: 'True',
         REQUIRE_HIGH_CONFIDENCE_ENTRY: 'False',
-        SENTIMENT_API_KEY: '711457e5-ef55-44b6-badc-9c45981eefe8',
+        SENTIMENT_API_KEY: process.env.SENTIMENT_API_KEY || '711457e5-ef55-44b6-badc-9c45981eefe8',
         ADX_PROTECT: process.env.ADX_PROTECT || 'True',
         // You can also set RECENT_KLINE_COUNT here, e.g. '20'
         // RECENT_KLINE_COUNT: '20'
