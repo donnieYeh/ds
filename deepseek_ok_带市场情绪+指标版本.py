@@ -166,6 +166,11 @@ def print_runtime_config():
                 adx_line += f" ADX_SMOOTHING_PERIOD={env_adx_smoothing}"
             adx_line += ")"
         print(adx_line)
+
+        env_sentiment_key = os.getenv("SENTIMENT_API_KEY")
+        print(
+            f"- 情绪API密钥: {'已配置' if env_sentiment_key else '未配置(将无法获取市场情绪)'}"
+        )
     except Exception as e:
         print(f"⚠️ 配置打印失败: {e}")
 
@@ -370,6 +375,16 @@ def calculate_intelligent_position_v2(signal_data, price_data, current_position)
 def calculate_adx(df, period: int, smoothing_period: int):
     """计算给定周期的ADX指标，支持单独的平滑周期。"""
     try:
+        price_cols = ['open', 'high', 'low', 'close']
+        for col in price_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        # 如果某一行四个关键价格全为NaN，用上一根K线的数据填充，避免滚动计算失败
+        if any(df[price_cols].isna().all(axis=1)):
+            print("⚠️ 发现全NaN的K线行，使用上一根数据填充")
+            df[price_cols] = df[price_cols].ffill()
+
         high = df['high']
         low = df['low']
         close = df['close']
@@ -396,7 +411,15 @@ def calculate_adx(df, period: int, smoothing_period: int):
         return adx
     except Exception as e:
         print(f"ADX计算失败: {e}")
-        return pd.Series([0] * len(df), index=df.index)
+        try:
+            preview_cols = [col for col in ['timestamp', 'open', 'high', 'low', 'close'] if col in df.columns]
+            print("⚠️ ADX数据源异常预览(尾部5条):")
+            print(df[preview_cols].tail(5))
+        except Exception as log_err:
+            print(f"⚠️ ADX异常数据打印失败: {log_err}")
+
+        # 返回全NaN序列，后续风控会跳过ADX保护
+        return pd.Series([pd.NA] * len(df), index=df.index)
 
 
 def generate_sma_analysis(source, short=5, mid=20, long=80, price_col="close"):
@@ -1545,7 +1568,11 @@ def get_sentiment_indicators():
     """获取情绪指标 - 简洁版本"""
     try:
         API_URL = "https://service.cryptoracle.network/openapi/v2/endpoint"
-        API_KEY = os.getenv("SENTIMENT_API_KEY", "711457e5-ef55-44b6-badc-9c45981eefe8")
+        API_KEY = os.getenv("SENTIMENT_API_KEY")
+
+        if not API_KEY:
+            print("⚠️ 未配置情绪API密钥(SENTIMENT_API_KEY)，跳过情绪指标获取")
+            return None
 
         # 获取最近4小时数据
         end_time = datetime.now()
@@ -2100,15 +2127,21 @@ def execute_intelligent_trade(signal_data, price_data):
         full_df = price_data.get('full_data')
         long_adx_series = None
         if isinstance(full_df, pd.DataFrame) and 'adx_long' in full_df.columns:
-            long_adx_series = full_df['adx_long']
+            long_adx_series = pd.to_numeric(full_df['adx_long'], errors='coerce')
 
-        short_adx = adx_data.get('adx_short')
+        raw_short_adx = adx_data.get('adx_short')
+        short_adx_series = pd.to_numeric(pd.Series([raw_short_adx]), errors='coerce') if raw_short_adx is not None else None
+        short_adx = None if short_adx_series is None else short_adx_series.iloc[0]
 
-        if long_adx_series is None or len(long_adx_series) < 2:
-            return False, "ADX长周期数据不足"
+        if long_adx_series is None:
+            return False, "ADX长周期数据不存在"
 
-        is_long_rising = long_adx_series.iloc[-1] > long_adx_series.iloc[-2]
-        short_adx_threshold = short_adx is not None and short_adx > 20
+        valid_long_adx = long_adx_series.dropna()
+        if len(valid_long_adx) < 2:
+            return False, "ADX长周期数据不足或全部为空"
+
+        is_long_rising = valid_long_adx.iloc[-1] > valid_long_adx.iloc[-2]
+        short_adx_threshold = short_adx is not None and pd.notna(short_adx) and short_adx > 20
 
         if short_adx_threshold and is_long_rising:
             return True, "ADX 条件满足"
